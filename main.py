@@ -1,3227 +1,5313 @@
-# SENTINEL - Roblox Audio Moderation Backend
-# Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
-
-from __future__ import annotations
-import asyncio, json, os, sqlite3, time, secrets, string, hashlib, uuid, gc, collections, ctypes
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List, Optional, Dict
-
-import httpx
-import psutil
-import psycopg2
-import psycopg2.extras
-from psycopg2 import pool as pg_pool
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="SENTINEL API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── ASSET TYPES ───────────────────────────────────────────────────────────────
-
-ALL_ASSET_TYPES = [
-    "Audio", "Decal", "Video", "Mesh",
-    "Plugin", "Animation", "Model", "Package"
-]
-# Note: "Image" is excluded — Roblox does not allow archiving images via API.
-# Images are system-generated from Decal uploads and cannot be archived.
-NON_ARCHIVABLE_TYPES = {"Image"}
-
-# ── SQLITE (local data — groups, history, config) ─────────────────────────────
-
-DB_PATH = os.environ.get("DB_PATH", "sentinel.db")
-
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS groups (
-            id TEXT, profile_id TEXT, name TEXT DEFAULT '', added_at REAL,
-            PRIMARY KEY (id, profile_id));
-        CREATE TABLE IF NOT EXISTS history (
-            id TEXT PRIMARY KEY, profile_id TEXT DEFAULT '',
-            username TEXT DEFAULT '', display_name TEXT DEFAULT '',
-            user_id TEXT DEFAULT '', audio_name TEXT DEFAULT '',
-            audio_id TEXT DEFAULT '', asset_type TEXT DEFAULT 'Audio',
-            group_id TEXT DEFAULT '', group_name TEXT DEFAULT '',
-            time TEXT, dm_status TEXT DEFAULT 'n/a', archived INTEGER DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS config (
-            profile_id TEXT, key TEXT, value TEXT,
-            PRIMARY KEY (profile_id, key));
-        CREATE TABLE IF NOT EXISTS connect_codes (
-            code TEXT PRIMARY KEY,
-            profile_id TEXT NOT NULL,
-            expiry REAL NOT NULL);
-    """)
-    conn.commit()
-
-    # ── Schema migrations: add columns that may be missing from old DB ──────────
-    migrations = [
-        "ALTER TABLE history ADD COLUMN profile_id TEXT DEFAULT ''",
-        "ALTER TABLE history ADD COLUMN display_name TEXT DEFAULT ''",
-        "ALTER TABLE history ADD COLUMN user_id TEXT DEFAULT ''",
-        "ALTER TABLE history ADD COLUMN asset_type TEXT DEFAULT 'Audio'",
-        "ALTER TABLE history ADD COLUMN group_id TEXT DEFAULT ''",
-        "ALTER TABLE history ADD COLUMN group_name TEXT DEFAULT ''",
-        "ALTER TABLE history ADD COLUMN dm_status TEXT DEFAULT 'n/a'",
-        "ALTER TABLE history ADD COLUMN archived INTEGER DEFAULT 1",
-        "ALTER TABLE groups ADD COLUMN profile_id TEXT DEFAULT ''",
-        "ALTER TABLE groups ADD COLUMN name TEXT DEFAULT ''",
-        "ALTER TABLE config ADD COLUMN profile_id TEXT DEFAULT ''",
-    ]
-    for sql in migrations:
-        try:
-            conn.execute(sql)
-            conn.commit()
-        except Exception:
-            pass  # Column already exists — safe to ignore
-
-    conn.close()
-
-init_db()
-
-# ── POSTGRES (profiles + saved credentials) ───────────────────────────────────
-
-PG_URL = os.environ.get("DATABASE_URL", "")
-
-_pg_pool = None
-
-def init_pg_pool():
-    global _pg_pool
-    if not PG_URL:
-        return
-    _pg_pool = pg_pool.ThreadedConnectionPool(
-        minconn=1,
-        maxconn=20,
-        dsn=PG_URL,
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    )
-    print("[SENTINEL] Postgres connection pool initialized (min=1, max=20)")
-
-def get_pg(retries: int = 20, delay: float = 0.1):
-    if _pg_pool is None:
-        raise RuntimeError("Postgres pool not initialized")
-    last_err = None
-    for _ in range(retries):
-        try:
-            return _pg_pool.getconn()
-        except pg_pool.PoolError as e:
-            # Pool is momentarily exhausted (e.g. a burst of rapid clicks).
-            # Wait briefly for a connection to free up instead of crashing
-            # the request with an unhandled 500.
-            last_err = e
-            time.sleep(delay)
-    print(f"[SENTINEL] Postgres pool exhausted after retries: {last_err}")
-    raise HTTPException(503, "Server is busy, please try again in a moment")
-
-def release_pg(conn):
-    if _pg_pool:
-        _pg_pool.putconn(conn)
-
-def init_pg():
-    if not PG_URL:
-        print("[SENTINEL] No DATABASE_URL set — Postgres features disabled")
-        return
-    conn1 = None
-    try:
-        # Step 1 — create tables
-        conn1 = get_pg()
-        cur1 = conn1.cursor()
-        cur1.execute("""
-            CREATE TABLE IF NOT EXISTS profiles (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                pin_hash TEXT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS saved_credentials (
-                profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-                roblox_user_id TEXT NOT NULL DEFAULT '',
-                cookie_encrypted TEXT,
-                account_info JSONB,
-                saved_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (profile_id, roblox_user_id)
-            );
-        """)
-        conn1.commit()
-    except Exception as e:
-        print(f"[SENTINEL] Postgres table creation error: {e}")
-        if conn1:
-            try: conn1.rollback()
-            except: pass
-    finally:
-        if conn1:
-            try: cur1.close()
-            except: pass
-            release_pg(conn1)
-
-    conn2 = None
-    try:
-        # Step 2 — fresh connection, force correct schema
-        conn2 = get_pg()
-        cur2 = conn2.cursor()
-
-        # Check if id column is wrong type and drop if so
-        cur2.execute("""
-            SELECT data_type FROM information_schema.columns
-            WHERE table_name='profiles' AND column_name='id'
-        """)
-        row = cur2.fetchone()
-        if row and row['data_type'] != 'text':
-            print("[SENTINEL] Dropping profiles table — wrong id type, recreating...")
-            cur2.execute("DROP TABLE IF EXISTS saved_credentials CASCADE;")
-            cur2.execute("DROP TABLE IF EXISTS profiles CASCADE;")
-            conn2.commit()
-
-        # Recreate with correct schema
-        cur2.execute("""
-            CREATE TABLE IF NOT EXISTS profiles (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                pin_hash TEXT NOT NULL,
-                avatar_url TEXT DEFAULT '',
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS saved_credentials (
-                profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-                roblox_user_id TEXT NOT NULL DEFAULT '',
-                cookie_encrypted TEXT,
-                account_info JSONB,
-                saved_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (profile_id, roblox_user_id)
-            );
-        """)
-        conn2.commit()
-
-        # Safe per-column migrations
-        for migration_sql in [
-            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''",
-            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS pin_length INTEGER DEFAULT 4",
-            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE",
-        ]:
-            try:
-                cur2.execute(migration_sql + ";")
-                conn2.commit()
-            except Exception as _me:
-                conn2.rollback()
-                print(f"[SENTINEL] Migration skipped: {_me}")
-
-        # New tables
-        cur2.execute("""
-            CREATE TABLE IF NOT EXISTS access_requests (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                email TEXT NOT NULL DEFAULT '',
-                status TEXT DEFAULT 'pending',
-                invite_code TEXT DEFAULT '',
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS invite_codes (
-                code TEXT PRIMARY KEY,
-                created_by TEXT NOT NULL,
-                used BOOLEAN DEFAULT FALSE,
-                used_by TEXT DEFAULT '',
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS review_tokens (
-                token TEXT PRIMARY KEY,
-                request_id TEXT NOT NULL,
-                action TEXT NOT NULL,
-                expires_at TIMESTAMPTZ NOT NULL,
-                used BOOLEAN DEFAULT FALSE
-            );
-        """)
-        conn2.commit()
-        # Add email col to access_requests if it was created without it
-        try:
-            cur2.execute("ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT '';")
-            conn2.commit()
-        except Exception as _me:
-            conn2.rollback()
-
-        # ── App data tables (groups, history, config, connect_codes) ──────────
-        cur2.execute("""
-            CREATE TABLE IF NOT EXISTS groups (
-                id TEXT,
-                profile_id TEXT DEFAULT '',
-                name TEXT DEFAULT '',
-                added_at FLOAT,
-                PRIMARY KEY (id, profile_id)
-            );
-            CREATE TABLE IF NOT EXISTS history (
-                id TEXT PRIMARY KEY,
-                profile_id TEXT DEFAULT '',
-                username TEXT DEFAULT '',
-                display_name TEXT DEFAULT '',
-                user_id TEXT DEFAULT '',
-                audio_name TEXT DEFAULT '',
-                audio_id TEXT DEFAULT '',
-                asset_type TEXT DEFAULT 'Audio',
-                group_id TEXT DEFAULT '',
-                group_name TEXT DEFAULT '',
-                time TEXT,
-                dm_status TEXT DEFAULT 'n/a',
-                archived INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS config (
-                profile_id TEXT,
-                key TEXT,
-                value TEXT,
-                PRIMARY KEY (profile_id, key)
-            );
-            CREATE TABLE IF NOT EXISTS connect_codes (
-                code TEXT PRIMARY KEY,
-                profile_id TEXT NOT NULL,
-                expiry FLOAT NOT NULL
-            );
-        """)
-        conn2.commit()
-        print("[SENTINEL] Postgres initialized")
-    except Exception as e:
-        print(f"[SENTINEL] Postgres migration error: {e}")
-        if conn2:
-            try: conn2.rollback()
-            except: pass
-    finally:
-        if conn2:
-            try: cur2.close()
-            except: pass
-            release_pg(conn2)
-
-init_pg_pool()
-init_pg()
-
-def hash_pin(pin: str) -> str:
-    return hashlib.sha256(pin.encode()).hexdigest()
-
-# ── EMAIL ─────────────────────────────────────────────────────────────────────
-GMAIL_USER      = os.environ.get("GMAIL_USER", "")
-GMAIL_PASS      = os.environ.get("GMAIL_PASS", "")
-ADMIN_EMAIL     = os.environ.get("ADMIN_EMAIL", "")
-BASE_URL        = os.environ.get("BASE_URL", "").rstrip("/")
-RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
-EMAIL_FROM      = os.environ.get("EMAIL_FROM", "Sentinel <onboarding@resend.dev>")
-
-def send_email(to: str, subject: str, html: str):
-    # Preferred path: Resend's HTTP API. Render (and many free-tier hosts)
-    # firewall outbound SMTP ports 25/465/587, which is what produces
-    # "[Errno 101] Network is unreachable" from smtplib — an HTTP call on
-    # port 443 sidesteps that entirely.
-    if RESEND_API_KEY:
-        try:
-            r = httpx.post(
-                "https://api.resend.com/emails",
-                headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-                json={"from": EMAIL_FROM, "to": [to], "subject": subject, "html": html},
-                timeout=10,
-            )
-            if r.status_code >= 400:
-                print(f"[SENTINEL] Email error: {r.status_code} {r.text}")
-            else:
-                print(f"[SENTINEL] Email sent to {to}")
-        except Exception as e:
-            print(f"[SENTINEL] Email error: {e}")
-        return
-
-    # Fallback: Gmail SMTP (works locally / on hosts that allow SMTP egress)
-    if not GMAIL_USER or not GMAIL_PASS:
-        print(f"[SENTINEL] Email not configured, skipping: {subject}")
-        return
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = f"Sentinel <{GMAIL_USER}>"
-    msg["To"]      = to
-    msg.attach(MIMEText(html, "html"))
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(GMAIL_USER, GMAIL_PASS)
-            s.sendmail(GMAIL_USER, to, msg.as_string())
-        print(f"[SENTINEL] Email sent to {to}")
-    except Exception as e:
-        print(f"[SENTINEL] Email error: {e}")
-
-# ── DEBUG / MEMORY / LOG SYSTEM ───────────────────────────────────────────────
-
-_LOG_BUFFER: collections.deque = collections.deque(maxlen=500)
-_DEBUG_MODE: bool = False
-_DEGRADED:   bool = False
-_MEMORY_MB:  float = 0.0
-_MEMORY_PCT: float = 0.0
-_MEM_TOTAL_MB: float = 0.0
-
-LOG_LEVELS = {"INFO", "WARN", "ERROR", "DEBUG", "ARCHIVE", "DM", "NETWORK", "MEMORY"}
-
-def sentinel_log(msg: str, level: str = "INFO", source: str = "SENTINEL"):
-    """Central log function — always buffers, prints always (debug filters on frontend)."""
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    entry = {
-        "ts":     ts,
-        "level":  level.upper(),
-        "source": source,
-        "msg":    msg,
-    }
-    _LOG_BUFFER.append(entry)
-    print(f"[{entry['source']}][{entry['level']}] {msg}")
-
-_libc = None
-def _trim_memory():
-    """Force glibc to release free memory back to the OS (fixes RSS bloat on Linux)."""
-    global _libc
-    try:
-        if _libc is None:
-            _libc = ctypes.CDLL("libc.so.6")
-        gc.collect()
-        _libc.malloc_trim(0)
-    except Exception:
-        pass  # Non-Linux or libc not available — safe to ignore
-
-async def memory_watchdog():
-    global _DEGRADED, _MEMORY_MB, _MEMORY_PCT, _MEM_TOTAL_MB
-    process = psutil.Process()
-    try:
-        vm = psutil.virtual_memory()
-        _MEM_TOTAL_MB = vm.total / 1024 / 1024
-    except Exception:
-        _MEM_TOTAL_MB = 512.0
-
-    LIMIT_MB = float(os.environ.get("MEMORY_LIMIT_MB", 400))
-
-    while True:
-        try:
-            rss = process.memory_info().rss / 1024 / 1024
-            _MEMORY_MB  = round(rss, 1)
-            _MEMORY_PCT = round((rss / LIMIT_MB) * 100, 1)
-
-            # Trim every cycle — malloc_trim is cheap and keeps RSS stable
-            _trim_memory()
-
-            if rss > LIMIT_MB and not _DEGRADED:
-                _DEGRADED = True
-                _trim_memory()
-                sentinel_log(f"High memory {rss:.1f}MB/{LIMIT_MB:.0f}MB — degraded mode ON", "MEMORY", "WATCHDOG")
-            elif rss < LIMIT_MB * 0.75 and _DEGRADED:
-                _DEGRADED = False
-                sentinel_log(f"Memory normal {rss:.1f}MB — degraded mode OFF", "MEMORY", "WATCHDOG")
-        except Exception as e:
-            sentinel_log(f"Watchdog error: {e}", "ERROR", "WATCHDOG")
-        await asyncio.sleep(4)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VAULT — master-key-protected backup/restore (works even with empty DB)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Set SENTINEL_MASTER_KEY in your Render env vars.
-# If not set, one is generated and printed to logs on startup — grab it from there.
-_MASTER_KEY: str = os.environ.get("SENTINEL_MASTER_KEY", "")
-
-# All tables in import order (FK-safe: profiles before saved_credentials, etc.)
-_VAULT_TABLES = [
-    "profiles",
-    "saved_credentials",
-    "access_requests",
-    "invite_codes",
-    "review_tokens",
-    "groups",
-    "history",
-    "config",
-    "connect_codes",
-]
-
-_TABLE_PKS = {
-    "profiles":          ["id"],
-    "saved_credentials": ["profile_id", "roblox_user_id"],
-    "access_requests":   ["id"],
-    "invite_codes":      ["code"],
-    "review_tokens":     ["token"],
-    "groups":            ["id", "profile_id"],
-    "history":           ["id"],
-    "config":            ["profile_id", "key"],
-    "connect_codes":     ["code"],
-}
-
-def _vault_check_key(key: str):
-    if not key or not _MASTER_KEY:
-        raise HTTPException(401, "Vault master key not configured or missing")
-    if not secrets.compare_digest(key.strip(), _MASTER_KEY.strip()):
-        raise HTTPException(403, "Invalid vault master key")
-
-def _vault_export_data() -> dict:
-    """Dump all Postgres tables to a plain-dict snapshot. Raises on failure."""
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    out: dict = {"_meta": {
-        "exported_at":      datetime.utcnow().isoformat() + "Z",
-        "sentinel_version": "1.0",
-    }}
-    try:
-        for table in _VAULT_TABLES:
-            try:
-                cur.execute(f"SELECT * FROM {table}")
-                rows = []
-                for row in cur.fetchall():
-                    d = {}
-                    for k, v in dict(row).items():
-                        if hasattr(v, "isoformat"):
-                            d[k] = v.isoformat()
-                        else:
-                            d[k] = v
-                    rows.append(d)
-                out[table] = rows
-                sentinel_log(f"Vault export: {table} → {len(rows)} rows", "INFO", "VAULT")
-            except Exception as e:
-                sentinel_log(f"Vault export: skipping {table} ({e})", "WARN", "VAULT")
-                out[table] = []
-        return out
-    finally:
-        cur.close(); release_pg(conn)
-
-def _vault_import_data(data: dict) -> dict:
-    """Upsert all rows from a vault snapshot. Returns per-table counts."""
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    if not isinstance(data, dict):
-        raise HTTPException(400, "Invalid vault data")
-
-    conn = get_pg(); cur = conn.cursor()
-    results: dict = {}
-    try:
-        for table in _VAULT_TABLES:
-            rows = data.get(table)
-            if not isinstance(rows, list) or not rows:
-                results[table] = 0
-                continue
-            pks = _TABLE_PKS.get(table)
-            if not pks:
-                continue
-            upserted = 0
-            for row in rows:
-                if not isinstance(row, dict) or not row:
-                    continue
-                cols   = list(row.keys())
-                vals   = [json.dumps(v) if isinstance(v, (dict, list)) else v for v in row.values()]
-                ph     = ", ".join(["%s"] * len(cols))
-                colstr = ", ".join(f'"{c}"' for c in cols)
-                non_pk = [c for c in cols if c not in pks]
-                if non_pk:
-                    set_clause = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in non_pk)
-                    conflict   = f"DO UPDATE SET {set_clause}"
-                else:
-                    conflict   = "DO NOTHING"
-                pk_str = ", ".join(f'"{p}"' for p in pks)
-                sql = (
-                    f'INSERT INTO "{table}" ({colstr}) VALUES ({ph}) '
-                    f"ON CONFLICT ({pk_str}) {conflict}"
-                )
-                try:
-                    cur.execute(sql, vals)
-                    upserted += 1
-                except Exception as row_err:
-                    conn.rollback()
-                    sentinel_log(f"Vault import row error ({table}): {row_err}", "WARN", "VAULT")
-                    continue
-            conn.commit()
-            results[table] = upserted
-            sentinel_log(f"Vault import: {table} → {upserted}/{len(rows)} rows", "INFO", "VAULT")
-        sentinel_log("Vault import complete", "INFO", "VAULT")
-        return results
-    except HTTPException:
-        raise
-    except Exception as e:
-        try: conn.rollback()
-        except: pass
-        raise HTTPException(500, f"Vault import failed: {e}")
-    finally:
-        cur.close(); release_pg(conn)
-
-
-class VaultKeyBody(BaseModel):
-    key: str
-
-class VaultImportBody(BaseModel):
-    key:  str
-    data: dict
-
-@app.post("/api/vault/export")
-def api_vault_export(body: VaultKeyBody):
-    """Export all data. Protected by SENTINEL_MASTER_KEY. No profile login required."""
-    _vault_check_key(body.key)
-    return _vault_export_data()
-
-@app.post("/api/vault/import")
-def api_vault_import(body: VaultImportBody):
-    """Import/restore all data. Protected by SENTINEL_MASTER_KEY. No profile login required."""
-    _vault_check_key(body.key)
-    results = _vault_import_data(body.data)
-    return {"imported": True, "tables": results}
-
-
-async def vault_auto_restore():
-    """
-    On startup: if Postgres is connected but completely empty (no profiles),
-    attempt to restore from the VAULT_AUTO_RESTORE_URL env var.
-
-    Set VAULT_AUTO_RESTORE_URL to a direct URL that returns your vault JSON
-    (e.g. a raw GitHub Gist URL, an R2 object URL, etc).
-    When you export, upload the file to that URL manually once.
-    After that, every fresh Postgres will auto-restore from it on boot.
-    """
-    restore_url = os.environ.get("VAULT_AUTO_RESTORE_URL", "").strip()
-    if not restore_url or not PG_URL:
-        return
-
-    await asyncio.sleep(8)  # Let DB init fully settle
-
-    try:
-        conn = get_pg(); cur = conn.cursor()
-        try:
-            cur.execute("SELECT COUNT(*) FROM profiles")
-            row = cur.fetchone()
-            count = list(row.values())[0] if row else 0
-        finally:
-            cur.close(); release_pg(conn)
-
-        if count > 0:
-            sentinel_log(f"Auto-restore: DB has {count} profile(s) — skipping", "INFO", "VAULT")
-            return
-
-        sentinel_log(f"Auto-restore: DB is empty — fetching backup from configured URL...", "INFO", "VAULT")
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(restore_url)
-        if r.status_code != 200:
-            sentinel_log(f"Auto-restore: fetch failed HTTP {r.status_code}", "ERROR", "VAULT")
-            return
-
-        data = r.json()
-        if not isinstance(data, dict) or "_meta" not in data:
-            sentinel_log("Auto-restore: URL did not return a valid vault snapshot", "ERROR", "VAULT")
-            return
-
-        results = _vault_import_data(data)
-        total   = sum(results.values())
-        sentinel_log(
-            f"Auto-restore: SUCCESS — {total} rows restored across {len(results)} tables. "
-            f"Details: {results}",
-            "INFO", "VAULT"
-        )
-    except Exception as e:
-        sentinel_log(f"Auto-restore: unexpected error — {e}", "ERROR", "VAULT")
-
-
-# Routes all app-data queries to Postgres when DATABASE_URL is set,
-# falls back to SQLite for local development.
-
-def db_exec(sql: str, params: tuple = (), *, fetch: str = None):
-    """
-    Execute SQL and optionally return results.
-    fetch='all' → list[dict], 'one' → dict|None, 'val' → scalar, None → None
-    Handles ? vs %s placeholder conversion automatically.
-    """
-    if PG_URL:
-        pg_sql = sql.replace("?", "%s")
-        conn = get_pg()
-        cur = conn.cursor()
-        try:
-            cur.execute(pg_sql, params)
-            conn.commit()
-            if fetch == "all":
-                return [dict(r) for r in cur.fetchall()]
-            if fetch == "one":
-                row = cur.fetchone()
-                return dict(row) if row else None
-            if fetch == "val":
-                row = cur.fetchone()
-                return (list(row.values())[0] if row else None)
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cur.close(); release_pg(conn)
-    else:
-        conn = get_db()
-        try:
-            cur = conn.execute(sql, params)
-            conn.commit()
-            if fetch == "all":
-                return [dict(r) for r in cur.fetchall()]
-            if fetch == "one":
-                row = cur.fetchone()
-                return dict(row) if row else None
-            if fetch == "val":
-                row = cur.fetchone()
-                return row[0] if row else None
-        finally:
-            conn.close()
-
-def db_upsert(table: str, pk_cols: list, data: dict):
-    """
-    INSERT … ON CONFLICT (pk_cols) DO UPDATE for Postgres,
-    INSERT OR REPLACE for SQLite.
-    """
-    cols   = list(data.keys())
-    vals   = list(data.values())
-    if PG_URL:
-        col_str    = ", ".join(cols)
-        ph_str     = ", ".join(["%s"] * len(cols))
-        conflict   = ", ".join(pk_cols)
-        update_str = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in pk_cols)
-        sql = (f"INSERT INTO {table} ({col_str}) VALUES ({ph_str}) "
-               f"ON CONFLICT ({conflict}) DO UPDATE SET {update_str}")
-        conn = get_pg()
-        cur = conn.cursor()
-        try:
-            cur.execute(sql, vals)
-            conn.commit()
-        except Exception:
-            conn.rollback(); raise
-        finally:
-            cur.close(); release_pg(conn)
-    else:
-        col_str = ", ".join(cols)
-        ph_str  = ", ".join(["?"] * len(cols))
-        sql = f"INSERT OR REPLACE INTO {table} ({col_str}) VALUES ({ph_str})"
-        conn = get_db()
-        try:
-            conn.execute(sql, vals)
-            conn.commit()
-        finally:
-            conn.close()
-
-def db_insert_ignore(table: str, data: dict):
-    """INSERT OR IGNORE (SQLite) / INSERT … ON CONFLICT DO NOTHING (Postgres)."""
-    cols  = list(data.keys())
-    vals  = list(data.values())
-    if PG_URL:
-        col_str = ", ".join(cols)
-        ph_str  = ", ".join(["%s"] * len(cols))
-        sql = f"INSERT INTO {table} ({col_str}) VALUES ({ph_str}) ON CONFLICT DO NOTHING"
-        conn = get_pg()
-        cur = conn.cursor()
-        try:
-            cur.execute(sql, vals)
-            conn.commit()
-        except Exception:
-            conn.rollback(); raise
-        finally:
-            cur.close(); release_pg(conn)
-    else:
-        col_str = ", ".join(cols)
-        ph_str  = ", ".join(["?"] * len(cols))
-        sql = f"INSERT OR IGNORE INTO {table} ({col_str}) VALUES ({ph_str})"
-        conn = get_db()
-        try:
-            conn.execute(sql, vals)
-            conn.commit()
-        finally:
-            conn.close()
-
-# ── APP STATE ─────────────────────────────────────────────────────────────────
-
-class ProfileSession:
-    def __init__(self):
-        self.profile_id:          Optional[str]  = None
-        self.cookie:              Optional[str]  = None
-        self.monitoring:          bool           = False
-        self.monitor_task:        Optional[asyncio.Task] = None
-        self.known_assets:        dict           = {}
-        self.account_info:        Optional[dict] = None
-        self.extension_last_seen: float          = 0.0
-        self.extension_token:     Optional[str]  = None   # shared secret issued at connect
-        self.extension_token_valid: bool         = False  # True only when token matched recently
-        self.pending_commands:    list           = []     # commands queued for extension to pick up
-        self.pending_save:        bool           = False
-        self.pending_save_info:   Optional[dict] = None
-        self.add_account_mode:    bool           = False
-
-_sessions: Dict[str, ProfileSession] = {}
-
-# ── SANITY CHECK SYSTEM ───────────────────────────────────────────────────────
-# Runs every 5 minutes (and immediately on startup) to validate all saved cookies.
-# Results are stored per (profile_id, roblox_user_id) so the frontend can render
-# expired labels without disrupting the monitor loop.
-
-_SANITY_CHECK_INTERVAL = 300  # 5 minutes
-
-# State shape:
-#   _sanity_results[profile_id][roblox_user_id] = {
-#       "valid": bool, "checked_at": float, "username": str, "userId": str
-#   }
-_sanity_results: Dict[str, Dict[str, dict]] = {}
-_sanity_running: bool = False
-_sanity_last_run: float = 0.0
-_sanity_phase2_state: Dict[str, dict] = {}  # set inside _run_phase2_activity_check
-
-async def _check_cookie_valid(cookie: str) -> bool:
-    """Hit Roblox /users/authenticated to verify a cookie is still valid.
-    Returns True if valid, False if expired/invalid. Never raises."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
-                "https://users.roblox.com/v1/users/authenticated",
-                cookies={".ROBLOSECURITY": cookie},
-            )
-            return r.status_code == 200
-    except Exception:
-        return False
-
-def _sanity_mark_valid(profile_id: str, roblox_user_id: str, username: str, cookie: str, acc_info: dict):
-    """Immediately mark an account as valid in the sanity results cache.
-    Called whenever a new account is added or activated so the UI doesn't show
-    it as expired before the next scheduled sanity check runs."""
-    if profile_id not in _sanity_results:
-        _sanity_results[profile_id] = {}
-    _sanity_results[profile_id][str(roblox_user_id)] = {
-        "valid":      True,
-        "checked_at": time.time(),
-        "username":   username,
-        "userId":     str(roblox_user_id),
-        "cookie":     cookie,
-        "acc_info":   acc_info,
-    }
-    sentinel_log(f"Sanity cache: marked {username} ({roblox_user_id}) as VALID after account add/activate", "DEBUG", "SANITY")
-
-async def run_sanity_check():
-    """
-    Full sanity check — two phases run back-to-back per profile.
-
-    PHASE 1 — Cookie validity:
-      Validates every saved credential against Roblox API.
-      If the active session's cookie just expired:
-        • Attempt auto-switch to the next saved account with a valid cookie.
-        • Send an email: either "switched to X" or "no valid account available — inactive".
-
-    PHASE 2 — Activity check:
-      Only runs if:
-        - A valid active account exists after phase 1
-        - Active monitoring is currently ON
-      Temporarily stops the monitor for 5 seconds then restarts it.
-      Frontend reads `phase2_active` + `phase2_countdown` from the status endpoint
-      to show the grayed-out toggle + countdown label.
-
-    Non-blocking — runs as an asyncio task, never touches the monitor loop except
-    during the intentional 5-second pause in phase 2.
-    """
-    global _sanity_running, _sanity_last_run
-    if _sanity_running:
-        sentinel_log("Sanity check already running — skipping", "DEBUG", "SANITY")
-        return
-    if not PG_URL:
-        sentinel_log("Sanity check skipped — no Postgres configured", "DEBUG", "SANITY")
-        return
-
-    _sanity_running = True
-    sentinel_log("Sanity check Phase 1 started — cookie validation", "INFO", "SANITY")
-    try:
-        # ── Fetch all saved credentials ───────────────────────────────────────
-        conn = get_pg(); cur = conn.cursor()
-        try:
-            cur.execute("SELECT profile_id, roblox_user_id, cookie_encrypted, account_info FROM saved_credentials")
-            rows = [dict(r) for r in cur.fetchall()]
-        except Exception as e:
-            sentinel_log(f"Sanity check DB error: {e}", "ERROR", "SANITY")
-            return
-        finally:
-            cur.close(); release_pg(conn)
-
-        sentinel_log(f"Sanity Phase 1: validating {len(rows)} saved credentials", "INFO", "SANITY")
-
-        # Group rows by profile so we can do per-profile auto-switch logic
-        by_profile: Dict[str, list] = {}
-        for row in rows:
-            pid_key = row.get("profile_id", "")
-            if pid_key not in by_profile:
-                by_profile[pid_key] = []
-            by_profile[pid_key].append(row)
-
-        # Profiles that need phase 2 after phase 1 completes
-        phase2_profiles: list = []
-
-        for profile_id, profile_rows in by_profile.items():
-            if profile_id not in _sanity_results:
-                _sanity_results[profile_id] = {}
-
-            # Validate all cookies for this profile
-            for row in profile_rows:
-                roblox_user_id = row.get("roblox_user_id", "")
-                cookie         = row.get("cookie_encrypted", "")
-                acc_info       = row.get("account_info") or {}
-                if isinstance(acc_info, str):
-                    try: acc_info = json.loads(acc_info)
-                    except: acc_info = {}
-
-                username = acc_info.get("displayName") or acc_info.get("username") or roblox_user_id
-
-                valid = await _check_cookie_valid(cookie) if cookie else False
-
-                was_valid = _sanity_results[profile_id].get(roblox_user_id, {}).get("valid", True)
-                _sanity_results[profile_id][roblox_user_id] = {
-                    "valid":      valid,
-                    "checked_at": time.time(),
-                    "username":   username,
-                    "userId":     roblox_user_id,
-                    "cookie":     cookie,       # kept in memory only, never sent to frontend
-                    "acc_info":   acc_info,
-                }
-                sentinel_log(
-                    f"Sanity P1 [{profile_id[:8]}] {username} ({roblox_user_id}): "
-                    f"{'VALID' if valid else 'EXPIRED'}",
-                    "INFO", "SANITY"
-                )
-
-                # ── Detect active-account expiry ──────────────────────────────
-                session = _sessions.get(profile_id)
-                if session and session.cookie and not valid:
-                    active_uid = str((session.account_info or {}).get("userId", ""))
-                    if active_uid == str(roblox_user_id) and was_valid:
-                        # Active account JUST expired — attempt auto-switch
-                        sentinel_log(
-                            f"ALERT: Active cookie expired for profile {profile_id} "
-                            f"account {username} ({roblox_user_id}) — attempting auto-switch",
-                            "ERROR", "SANITY"
-                        )
-                        switched_to = await _try_switch_account(profile_id, roblox_user_id, profile_rows)
-                        if ADMIN_EMAIL:
-                            _send_cookie_expired_email(
-                                profile_id, username, roblox_user_id, switched_to
-                            )
-
-            # ── Determine if phase 2 should run for this profile ──────────────
-            session = _sessions.get(profile_id)
-            if session and session.cookie and session.monitoring:
-                # Only run phase 2 if we have a valid active account
-                active_uid = str((session.account_info or {}).get("userId", ""))
-                acct_result = _sanity_results[profile_id].get(active_uid, {})
-                if acct_result.get("valid", False):
-                    phase2_profiles.append(profile_id)
-                else:
-                    sentinel_log(
-                        f"Sanity Phase 2 skipped for {profile_id[:8]} — no valid active account",
-                        "INFO", "SANITY"
-                    )
-            else:
-                reason = "no active account" if not (session and session.cookie) else "monitoring is OFF"
-                sentinel_log(
-                    f"Sanity Phase 2 skipped for {profile_id[:8]} — {reason}",
-                    "INFO", "SANITY"
-                )
-
-        _sanity_last_run = time.time()
-        sentinel_log("Sanity Phase 1 complete", "INFO", "SANITY")
-
-        # ── PHASE 2: Activity check ───────────────────────────────────────────
-        for profile_id in phase2_profiles:
-            await _run_phase2_activity_check(profile_id)
-
-        sentinel_log("Sanity check complete (all phases)", "INFO", "SANITY")
-
-    except Exception as e:
-        sentinel_log(f"Sanity check unexpected error: {e}", "ERROR", "SANITY")
-    finally:
-        _sanity_running = False
-
-
-async def _try_switch_account(profile_id: str, expired_uid: str, all_rows: list) -> Optional[dict]:
-    """
-    Attempt to switch the active session to another saved account with a valid cookie.
-    Returns account info dict of the new account if switched, None if no valid account found.
-    """
-    session = _sessions.get(profile_id)
-    if not session:
-        return None
-
-    # Find the first valid account that isn't the expired one
-    profile_results = _sanity_results.get(profile_id, {})
-    for uid, result in profile_results.items():
-        if uid == expired_uid:
-            continue
-        if result.get("valid") and result.get("cookie"):
-            new_cookie   = result["cookie"]
-            new_acc_info = result.get("acc_info", {})
-            new_username = result.get("username", uid)
-            try:
-                # Re-validate just to be sure
-                still_valid = await _check_cookie_valid(new_cookie)
-                if not still_valid:
-                    continue
-                # Switch session
-                session.cookie       = new_cookie
-                session.account_info = new_acc_info
-                sentinel_log(
-                    f"Auto-switched profile {profile_id[:8]} from expired {expired_uid} "
-                    f"to {new_username} ({uid})",
-                    "INFO", "SANITY"
-                )
-                return {"username": new_username, "userId": uid, "acc_info": new_acc_info}
-            except Exception as e:
-                sentinel_log(f"Auto-switch error for uid {uid}: {e}", "WARN", "SANITY")
-                continue
-
-    # No valid account found — clear the session cookie so monitoring stops cleanly
-    session.cookie       = None
-    session.account_info = None
-    if session.monitoring:
-        session.monitoring = False
-        if session.monitor_task:
-            session.monitor_task.cancel()
-            try: await session.monitor_task
-            except: pass
-            session.monitor_task = None
-        set_cfg(profile_id, "_monitoringActive", False)
-        sentinel_log(
-            f"No valid fallback account for {profile_id[:8]} — monitoring stopped",
-            "ERROR", "SANITY"
-        )
-    return None
-
-
-async def _run_phase2_activity_check(profile_id: str):
-    """
-    Phase 2 — Activity sanity check.
-    Briefly pauses monitoring for 5 seconds then restarts it.
-    Updates _sanity_phase2_state so the frontend can show the grayed-out toggle + countdown.
-    """
-    session = _sessions.get(profile_id)
-    if not session or not session.monitoring or not session.cookie:
-        sentinel_log(f"Phase 2 skipped for {profile_id[:8]} — preconditions not met at start", "INFO", "SANITY")
-        return
-
-    sentinel_log(f"Sanity Phase 2 started for {profile_id[:8]} — activity check", "INFO", "SANITY")
-
-    # Mark phase 2 as active so frontend grays out toggle
-    _sanity_phase2_state[profile_id] = {"active": True, "countdown": 5}
-
-    try:
-        # Pause monitoring
-        session.monitoring = False
-        if session.monitor_task:
-            session.monitor_task.cancel()
-            try: await session.monitor_task
-            except: pass
-            session.monitor_task = None
-
-        # Countdown — update state each second so frontend gets live countdown
-        for remaining in range(5, 0, -1):
-            _sanity_phase2_state[profile_id]["countdown"] = remaining
-            await asyncio.sleep(1)
-
-        # Restart monitoring — clear unsupported cache so next cycle retries all types fresh
-        _unsupported_group_types.clear()
-        session.monitoring   = True
-        session.monitor_task = asyncio.create_task(monitor_loop(profile_id))
-        set_cfg(profile_id, "_monitoringActive", True)
-        sentinel_log(f"Sanity Phase 2 complete for {profile_id[:8]} — monitoring restarted", "INFO", "SANITY")
-
-    except Exception as e:
-        sentinel_log(f"Phase 2 error for {profile_id[:8]}: {e}", "ERROR", "SANITY")
-        # Best-effort restart on error
-        try:
-            if session.cookie and not session.monitoring:
-                session.monitoring   = True
-                session.monitor_task = asyncio.create_task(monitor_loop(profile_id))
-        except Exception:
-            pass
-    finally:
-        _sanity_phase2_state[profile_id] = {"active": False, "countdown": 0}
-
-
-def _send_cookie_expired_email(
-    profile_id: str,
-    username: str,
-    roblox_user_id: str,
-    switched_to: Optional[dict],
-):
-    """Send an email alert that the active account's cookie has expired.
-    If switched_to is provided, the email mentions the auto-switch.
-    If None, the email warns that no valid account was available."""
-
-    if switched_to:
-        subject     = "[SENTINEL] ⚠ Cookie Expired — Auto-Switched Account"
-        new_name    = switched_to.get("username", "Unknown")
-        new_uid     = switched_to.get("userId", "—")
-        status_block = f"""
-  <div style="background:rgba(100,200,120,0.08);border:1px solid rgba(100,200,120,0.3);border-radius:8px;padding:16px;margin-bottom:20px;">
-    <div style="color:#6ade80;font-weight:700;font-size:14px;letter-spacing:2px;margin-bottom:8px;">✓ AUTO-SWITCHED</div>
-    <div style="color:#ccc;font-size:13px;line-height:1.6;">
-      Sentinel automatically switched to another saved account with a valid cookie.
-      Monitoring is <strong style="color:#6ade80;">continuing</strong> under the new account.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SENTINEL — Roblox Asset Moderation</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&family=Outfit:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #0a0a0a;
+    --surface: rgba(30, 30, 30, 0.72);
+    --surface2: rgba(38, 38, 38, 0.68);
+    --surface3: rgba(48, 48, 48, 0.65);
+    --border: rgba(255,255,255,0.11);
+    --border-bright: rgba(255,255,255,0.26);
+    --accent: #ffffff;
+    --accent3: #ff3b3b;
+    --warn: #f0c040;
+    --text: #e8e8e8;
+    --text-dim: rgba(232,232,232,0.52);
+    --text-dimmer: rgba(232,232,232,0.28);
+    --font-mono: 'DM Mono', monospace;
+    --font-ui: 'Outfit', sans-serif;
+    --font-display: 'Syne', sans-serif;
+  }
+
+  html, body { height: 100%; background: #000; color: var(--text); font-family: var(--font-ui); font-size: 15px; overflow: hidden; }
+
+  /* ── VIDEO BACKGROUND ── */
+  #bg-video {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; object-position: center;
+    z-index: 0; pointer-events: none;
+  }
+
+  /* dim overlay so content stays readable */
+  #bg-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.55);
+    z-index: 0; pointer-events: none;
+  }
+
+  body::after {
+    content: ''; position: fixed; inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.035'/%3E%3C/svg%3E");
+    pointer-events: none; z-index: 9999; opacity: 0.4;
+  }
+
+  .corner-decor { position: fixed; width: 80px; height: 80px; pointer-events: none; z-index: 2; }
+  .corner-decor::before, .corner-decor::after { content: ''; position: absolute; background: rgba(255,255,255,0.3); }
+  .corner-decor.tl { top: 12px; left: 12px; }
+  .corner-decor.tl::before { top:0;left:0;width:30px;height:2px; } .corner-decor.tl::after { top:0;left:0;width:2px;height:30px; }
+  .corner-decor.tr { top: 12px; right: 12px; }
+  .corner-decor.tr::before { top:0;right:0;width:30px;height:2px; } .corner-decor.tr::after { top:0;right:0;width:2px;height:30px; }
+  .corner-decor.bl { bottom: 12px; left: 12px; }
+  .corner-decor.bl::before { bottom:0;left:0;width:30px;height:2px; } .corner-decor.bl::after { bottom:0;left:0;width:2px;height:30px; }
+  .corner-decor.br { bottom: 12px; right: 12px; }
+  .corner-decor.br::before { bottom:0;right:0;width:30px;height:2px; } .corner-decor.br::after { bottom:0;right:0;width:2px;height:30px; }
+
+  /* ── LAYOUT ── */
+  #app { position: relative; z-index: 1; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+  /* ── TOPBAR ── */
+  #topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 28px; border-bottom: 1px solid var(--border);
+    background: rgba(10,10,10,0.75); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); flex-shrink: 0;
+  }
+
+  .logo-lockup { display: flex; align-items: center; gap: 14px; }
+  .logo-icon { width: 36px; height: 36px; border: 1px solid rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; border-radius: 8px; background: rgba(255,255,255,0.06); }
+  .logo-icon svg { width: 18px; height: 18px; }
+  .logo-text { font-family: var(--font-display); font-size: 22px; font-weight: 800; letter-spacing: 5px; color: #fff; }
+  .logo-sub { font-family: var(--font-mono); font-size: 9px; color: var(--text-dimmer); letter-spacing: 2px; text-transform: uppercase; margin-top: 2px; }
+
+  .status-pill { display: flex; align-items: center; gap: 8px; padding: 6px 14px; border: 1px solid var(--border); background: var(--surface); font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); letter-spacing: 1px; border-radius: 6px; }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dimmer); transition: all 0.4s; }
+  .status-dot.online { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse-dot 2s infinite; }
+  .status-dot.error { background: var(--accent3); box-shadow: 0 0 8px var(--accent3); }
+  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  /* profile pill in topbar */
+  .profile-pill {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 14px; border: 1px solid var(--border);
+    background: var(--surface); border-radius: 6px; cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .profile-pill:hover { border-color: var(--border-bright); }
+  .profile-pill-avatar { width: 24px; height: 24px; border-radius: 50%; background: var(--surface3); border: 1px solid var(--border); overflow: hidden; display: flex; align-items: center; justify-content: center; font-family: var(--font-display); font-weight: 700; font-size: 11px; color: rgba(255,255,255,0.6); flex-shrink: 0; }
+  .profile-pill-avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+  .profile-pill-name { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); letter-spacing: 1px; }
+
+  /* ── NAV ── */
+  #nav { display: flex; gap: 2px; padding: 0 28px; background: rgba(10,10,10,0.70); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .nav-tab { padding: 11px 22px; font-family: var(--font-display); font-size: 13px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: var(--text-dimmer); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.25s; background: none; border-top: none; border-left: none; border-right: none; white-space: nowrap; }
+  .nav-tab:hover { color: var(--text); }
+  .nav-tab.active { color: #fff; border-bottom-color: #fff; }
+  .nav-tab .tab-badge { position: absolute; top: 6px; right: 6px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent3); box-shadow: 0 0 6px var(--accent3); display: none; }
+  .nav-tab .tab-badge.show { display: block; }
+
+  /* ── CONTENT ── */
+  #content { flex: 1; overflow: hidden; position: relative; }
+  .tab-panel { position: absolute; inset: 0; overflow-y: auto; padding: 28px; display: none; animation: fadeIn 0.2s ease; }
+  .tab-panel.active { display: block; }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+
+  /* ── CARDS ── */
+  .card { background: var(--surface); border: 1px solid var(--border); padding: 20px; border-radius: 12px; transition: border-color 0.25s, box-shadow 0.25s; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+  .card:hover { border-color: rgba(255,255,255,0.18); box-shadow: 0 4px 32px rgba(0,0,0,0.4); }
+
+  .section-title { font-family: var(--font-display); font-size: 11px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: rgba(255,255,255,0.6); margin-bottom: 18px; display: flex; align-items: center; gap: 12px; }
+  .section-title::before { content: ''; display: inline-block; width: 16px; height: 1px; background: rgba(255,255,255,0.35); }
+  .section-title::after { content: ''; flex: 1; height: 1px; background: linear-gradient(90deg,rgba(255,255,255,0.08),transparent); pointer-events: none; }
+
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit,minmax(320px,1fr)); gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit,minmax(240px,1fr)); gap: 16px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 12px; }
+  .mb-20 { margin-bottom: 20px; }
+  .mb-28 { margin-bottom: 28px; }
+
+  /* ── INPUTS ── */
+  .field-label { font-family: var(--font-mono); font-size: 10px; letter-spacing: 2px; color: var(--text-dimmer); text-transform: uppercase; margin-bottom: 8px; display: block; }
+  input[type="text"], input[type="password"], input[type="url"], input[type="number"], input[type="email"], textarea, select { width: 100%; background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; font-family: var(--font-mono); font-size: 12px; transition: all 0.2s; outline: none; appearance: none; border-radius: 6px; }
+  input:focus, textarea:focus, select:focus { border-color: rgba(255,255,255,0.3); background: rgba(255,255,255,0.06); }
+  textarea { resize: vertical; min-height: 90px; }
+  select option { background: var(--surface2); color: var(--text); }
+
+  /* ── BUTTONS ── */
+  .btn { padding: 10px 20px; font-family: var(--font-display); font-size: 12px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; cursor: pointer; border: 1px solid var(--border); background: transparent; color: var(--text-dim); transition: all 0.2s; border-radius: 6px; }
+  .btn:hover { border-color: rgba(255,255,255,0.22); background: rgba(255,255,255,0.05); color: var(--text); }
+  .btn-primary { border-color: rgba(255,255,255,0.25); color: #fff; background: rgba(255,255,255,0.08); }
+  .btn-primary:hover { background: rgba(255,255,255,0.14); border-color: rgba(255,255,255,0.4); }
+  .btn-danger { border-color: rgba(255,59,59,0.35); color: #ff5f5f; background: rgba(255,59,59,0.06); }
+  .btn-danger:hover { background: rgba(255,59,59,0.12); }
+  .btn-warn { border-color: rgba(240,192,64,0.35); color: var(--warn); }
+  .btn-sm { padding: 6px 14px; font-size: 11px; }
+  .btn-block { width: 100%; }
+  .btn-group { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+
+  /* ── TOGGLE ── */
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+  .toggle-label { font-size: 14px; font-weight: 600; color: var(--text); }
+  .toggle-desc { font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer); margin-top: 3px; }
+  .toggle-sw { width: 44px; height: 24px; background: rgba(255,255,255,0.1); border: 1px solid var(--border); border-radius: 12px; position: relative; cursor: pointer; flex-shrink: 0; transition: all 0.3s; }
+  .toggle-sw::after { content: ''; position: absolute; width: 18px; height: 18px; background: var(--text-dim); border-radius: 50%; top: 2px; left: 2px; transition: all 0.3s; }
+  .toggle-sw.on { background: rgba(255,255,255,0.15); border-color: rgba(255,255,255,0.3); }
+  .toggle-sw.on::after { left: 22px; background: #fff; }
+
+  /* ── SLIDER ── */
+  .slider-row { display: flex; align-items: center; gap: 14px; }
+  input[type="range"] { flex: 1; -webkit-appearance: none; height: 2px; background: rgba(255,255,255,0.1); border: none; border-radius: 2px; outline: none; padding: 0; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #fff; cursor: pointer; }
+  .slider-val { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); min-width: 55px; text-align: right; }
+
+  /* ── BADGES ── */
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; font-family: var(--font-mono); font-size: 10px; letter-spacing: 1px; border-radius: 2px; text-transform: uppercase; }
+  .badge-active { background: rgba(255,255,255,0.08); color: #d0d0d0; border: 1px solid rgba(255,255,255,0.15); }
+  .badge-inactive { background: rgba(255,59,59,0.1); color: #ff6b6b; border: 1px solid rgba(255,59,59,0.2); }
+  .badge-info { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.7); border: 1px solid rgba(255,255,255,0.1); }
+
+  /* ── STAT CARDS ── */
+  .stat-card { background: var(--surface); border: 1px solid var(--border); padding: 18px 20px; border-radius: 10px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+  .stat-value { font-family: var(--font-display); font-size: 36px; font-weight: 800; color: #fff; line-height: 1; }
+  .stat-label { font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer); letter-spacing: 2px; text-transform: uppercase; margin-top: 6px; }
+
+  /* ── HISTORY ── */
+  .history-item { background: var(--surface); border: 1px solid var(--border); padding: 16px 18px; margin-bottom: 8px; display: flex; align-items: center; gap: 16px; border-radius: 10px; transition: all 0.2s; }
+  .history-item:hover { border-color: rgba(255,255,255,0.12); background: var(--surface2); }
+  .history-avatar { width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface3); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-family: var(--font-display); font-weight: 700; font-size: 16px; color: rgba(255,255,255,0.6); }
+  .history-user { flex: 1; min-width: 0; }
+  .history-user .display-name { font-weight: 700; font-size: 14px; }
+  .history-user .username { font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer); }
+  .history-audio { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: rgba(255,255,255,0.04); border: 1px solid var(--border); margin-top: 8px; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); border-radius: 4px; }
+  .history-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex-shrink: 0; }
+  .history-time { font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer); }
+
+  /* ── GROUP ITEM ── */
+  .group-item { background: var(--surface2); border: 1px solid var(--border); padding: 16px 18px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; border-radius: 8px; }
+
+  /* ── ASSET TYPE FILTER ── */
+  .asset-filter-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .asset-chip { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface2); cursor: pointer; transition: all 0.2s; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); user-select: none; }
+  .asset-chip:hover { border-color: rgba(255,255,255,0.2); color: var(--text); }
+  .asset-chip.selected { border-color: rgba(255,255,255,0.35); background: rgba(255,255,255,0.07); color: #fff; }
+  .asset-chip-dot { width: 8px; height: 8px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.3); flex-shrink: 0; transition: all 0.2s; }
+  .asset-chip.selected .asset-chip-dot { background: #fff; border-color: #fff; }
+
+  /* ── WHITELIST TABS ── */
+  .wl-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .wl-tab { padding: 5px 12px; font-family: var(--font-mono); font-size: 10px; letter-spacing: 1px; border: 1px solid var(--border); border-radius: 4px; cursor: pointer; background: transparent; color: var(--text-dimmer); transition: all 0.2s; }
+  .wl-tab:hover { border-color: rgba(255,255,255,0.2); color: var(--text); }
+  .wl-tab.active { border-color: rgba(255,255,255,0.3); color: #fff; background: rgba(255,255,255,0.06); }
+
+  /* ── TOAST ── */
+  #toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9000; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
+  .toast { padding: 12px 18px; background: var(--surface2); border-left: 2px solid rgba(255,255,255,0.3); font-family: var(--font-mono); font-size: 11px; animation: toast-in 0.3s ease, toast-out 0.3s ease 2.7s forwards; pointer-events: auto; max-width: 320px; box-shadow: 0 4px 24px rgba(0,0,0,0.6); border-radius: 6px; }
+  .toast.success { border-color: rgba(200,200,200,0.4); }
+  .toast.error { border-color: rgba(255,59,59,0.5); }
+  .toast.warn { border-color: rgba(240,192,64,0.5); }
+  @keyframes toast-in { from{opacity:0;transform:translateX(20px)} to{opacity:1;transform:translateX(0)} }
+  @keyframes toast-out { from{opacity:1} to{opacity:0;pointer-events:none} }
+
+  /* ── CRASH RECOVERY OVERLAY ── */
+  #crash-overlay { position: fixed; inset: 0; z-index: 100000; background: #0a0a0a; display: flex; align-items: center; justify-content: center; }
+  #crash-overlay.hidden { display: none; }
+  .crash-box { text-align: center; max-width: 380px; padding: 32px; }
+  .crash-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent3); margin: 0 auto 22px; box-shadow: 0 0 14px rgba(255,59,59,0.6); animation: crash-pulse 1.4s infinite; }
+  .crash-dot.updating { background: var(--warn); box-shadow: 0 0 14px rgba(240,192,64,0.6); }
+  @keyframes crash-pulse { 0%,100%{opacity:1;transform:scale(1);} 50%{opacity:.35;transform:scale(.7);} }
+  .crash-sub.updating { color: var(--warn); }
+  .crash-title { font-family: var(--font-display); font-size: 22px; font-weight: 800; letter-spacing: 6px; color: #fff; }
+  .crash-sub { font-family: var(--font-mono); font-size: 10px; letter-spacing: 3px; color: var(--accent3); margin-top: 9px; text-transform: uppercase; }
+  .crash-msg { font-size: 13px; color: var(--text-dim); margin-top: 18px; line-height: 1.6; }
+  .crash-bar { width: 100%; height: 3px; background: rgba(255,255,255,0.08); border-radius: 4px; margin-top: 26px; overflow: hidden; }
+  .crash-bar-fill { height: 100%; width: 0%; background: #fff; border-radius: 4px; transition: width 0.5s ease; }
+  .crash-status { font-family: var(--font-mono); font-size: 10px; letter-spacing: 1px; color: var(--text-dimmer); margin-top: 12px; }
+
+  /* ── MIGRATION NOTICE POPUP ── */
+  #migration-popup {
+    position: fixed; inset: 0; z-index: 99000;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+    background: rgba(0,0,0,0.82);
+    animation: fadeIn 0.3s ease;
+  }
+  #migration-popup.hidden { display: none; }
+  #migration-popup-box {
+    background: rgba(18,18,18,0.95);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 16px;
+    padding: 36px 32px;
+    max-width: 540px; width: 100%;
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    box-shadow: 0 32px 80px rgba(0,0,0,0.8);
+    animation: fadeIn 0.35s ease;
+  }
+  #migration-popup-box .mig-tag {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--font-mono); font-size: 9px; letter-spacing: 2px;
+    color: var(--warn); background: rgba(240,192,64,0.08);
+    border: 1px solid rgba(240,192,64,0.22);
+    padding: 4px 10px; border-radius: 4px; margin-bottom: 18px;
+  }
+  #migration-popup-box h2 {
+    font-family: var(--font-display); font-size: 22px; font-weight: 800;
+    letter-spacing: 3px; color: #fff; margin-bottom: 14px;
+  }
+  #migration-popup-box p {
+    font-family: var(--font-ui); font-size: 13px; line-height: 1.75;
+    color: rgba(232,232,232,0.65); margin-bottom: 12px;
+  }
+  #migration-popup-box .mig-highlight {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 8px; padding: 14px 16px; margin-bottom: 20px;
+  }
+  #migration-popup-box .mig-highlight li {
+    font-family: var(--font-mono); font-size: 11px;
+    color: rgba(232,232,232,0.7); line-height: 2;
+    list-style: none; padding-left: 0;
+  }
+  #migration-popup-box .mig-highlight li::before {
+    content: '→ '; color: var(--warn);
+  }
+  #migration-popup-box .mig-lifetime {
+    font-family: var(--font-mono); font-size: 11px;
+    color: rgba(100,220,130,0.85);
+    background: rgba(100,220,130,0.07);
+    border: 1px solid rgba(100,220,130,0.18);
+    border-radius: 6px; padding: 10px 14px; margin-bottom: 22px;
+  }
+  #migration-popup-ok {
+    width: 100%; padding: 13px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.22);
+    color: #fff; font-family: var(--font-display);
+    font-size: 13px; font-weight: 700; letter-spacing: 2px;
+    border-radius: 8px; cursor: pointer;
+    transition: all 0.2s;
+  }
+  #migration-popup-ok:hover {
+    background: rgba(255,255,255,0.14);
+    border-color: rgba(255,255,255,0.4);
+  }
+
+  /* ── PROFILE SCREEN MIGRATION BANNER ── */
+  #profile-migration-banner {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 18px; margin-bottom: 22px;
+    background: rgba(240,192,64,0.07);
+    border: 1px solid rgba(240,192,64,0.25);
+    border-radius: 8px; max-width: 700px; width: 100%;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  }
+  #profile-migration-banner .pmb-icon {
+    font-size: 14px; flex-shrink: 0;
+  }
+  #profile-migration-banner span {
+    font-family: var(--font-mono); font-size: 10px;
+    color: rgba(240,192,64,0.85); letter-spacing: 1px; line-height: 1.6;
+  }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 500; display: none; align-items: center; justify-content: center; padding: 20px; }
+  .modal-overlay.open { display: flex; }
+  .modal-box { background: var(--surface); border: 1px solid rgba(255,255,255,0.14); padding: 32px; width: 100%; max-width: 520px; max-height: 85vh; overflow-y: auto; position: relative; border-radius: 14px; box-shadow: 0 24px 80px rgba(0,0,0,0.7); animation: fadeIn 0.2s ease; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
+  .modal-box-lg { max-width: 760px; max-height: 82vh; display: flex; flex-direction: column; }
+  .settings-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; flex-wrap: wrap; }
+  .settings-tab-btn { padding: 9px 16px; font-family: var(--font-display); font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-dimmer); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; }
+  .settings-tab-btn:hover { color: var(--text-dim); }
+  .settings-tab-btn.active { color: #fff; border-bottom-color: #fff; }
+  .settings-tab-body { overflow-y: auto; flex: 1; padding-right: 4px; }
+  .settings-tab-panel { display: none; }
+  .settings-tab-panel.active { display: block; }
+  .modal-close { position: absolute; top: 16px; right: 16px; background: none; border: 1px solid var(--border); color: var(--text-dim); width: 28px; height: 28px; cursor: pointer; font-size: 14px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; border-radius: 6px; z-index: 10; }
+  .modal-close:hover { border-color: rgba(255,59,59,0.4); color: #ff6b6b; }
+
+  /* ── PROFILE SELECTOR SCREEN ── */
+  #profile-screen {
+    position: fixed; inset: 0; z-index: 200;
+    background: var(--bg); display: flex; align-items: center; justify-content: center;
+    flex-direction: column; padding: 40px 20px;
+  }
+  #profile-screen.hidden { display: none; }
+
+  #exe-screen {
+    position: fixed; inset: 0; z-index: 210;
+    background: var(--bg); display: flex; align-items: center; justify-content: center;
+    flex-direction: column; padding: 40px 20px;
+  }
+  #exe-screen.hidden { display: none; }
+  #exe-screen-box {
+    width: 100%; max-width: 380px;
+    background: var(--surface); border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 14px; padding: 32px; box-shadow: 0 24px 80px rgba(0,0,0,0.7);
+  }
+
+  .profile-screen-logo { text-align: center; margin-bottom: 40px; }
+  .profile-screen-logo .big-logo { font-family: var(--font-display); font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #fff; }
+  .profile-screen-logo .big-sub { font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer); letter-spacing: 3px; margin-top: 6px; }
+
+  .profile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 16px; width: 100%; max-width: 700px; margin-bottom: 24px; }
+  .profile-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px 16px; text-align: center; cursor: pointer; transition: all 0.25s; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+  .profile-card:hover { border-color: rgba(255,255,255,0.25); background: var(--surface2); transform: translateY(-2px); }
+  .profile-card.add-card { border-style: dashed; border-color: rgba(255,255,255,0.1); }
+  .profile-card.add-card:hover { border-color: rgba(255,255,255,0.25); }
+  .profile-card { position: relative; }
+  .profile-delete-btn {
+    position: absolute; top: 8px; right: 8px;
+    width: 24px; height: 24px;
+    border-radius: 50%;
+    background: rgba(255,59,59,0.15);
+    border: 1px solid rgba(255,59,59,0.3);
+    color: #ff5f5f;
+    font-size: 12px;
+    display: none;
+    align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    z-index: 10;
+  }
+  .profile-delete-btn:hover { background: rgba(255,59,59,0.3); }
+  .profile-card:hover .profile-delete-btn { display: flex; }
+
+  .profile-card-avatar { width: 64px; height: 64px; border-radius: 50%; border: 2px solid var(--border); background: var(--surface3); margin: 0 auto 14px; overflow: hidden; display: flex; align-items: center; justify-content: center; font-family: var(--font-display); font-weight: 800; font-size: 24px; color: rgba(255,255,255,0.5); }
+  .profile-card-avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+  .profile-card-name { font-family: var(--font-display); font-size: 15px; font-weight: 700; letter-spacing: 1px; color: #fff; margin-bottom: 4px; }
+  .profile-card-sub { font-family: var(--font-mono); font-size: 9px; color: var(--text-dimmer); letter-spacing: 1px; }
+
+  /* ── PIN MODAL ── */
+  .pin-display { display: flex; gap: 12px; justify-content: center; margin: 24px 0; }
+  .pin-dot { width: 16px; height: 16px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.2); transition: all 0.2s; }
+  .pin-dot.filled { background: #fff; border-color: #fff; }
+  .pin-keypad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; max-width: 240px; margin: 0 auto; }
+  .pin-key { padding: 16px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; font-family: var(--font-display); font-size: 18px; font-weight: 700; color: var(--text); cursor: pointer; transition: all 0.15s; text-align: center; }
+  .pin-key:hover { background: var(--surface3); border-color: rgba(255,255,255,0.2); }
+  .pin-key:active { transform: scale(0.95); }
+  .pin-key.del { font-size: 14px; color: var(--text-dim); }
+
+  /* ── INFO BOX ── */
+  .info-box { padding: 12px 16px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); font-family: var(--font-mono); font-size: 11px; line-height: 1.7; color: var(--text-dim); margin-bottom: 16px; border-radius: 6px; }
+  .info-box.warn-box { background: rgba(240,192,64,0.05); border-color: rgba(240,192,64,0.18); color: var(--warn); }
+
+  .divider { height: 1px; background: linear-gradient(90deg,transparent,var(--border),transparent); margin: 28px 0; }
+
+  .danger-zone { border: 1px solid rgba(255,77,109,0.3); padding: 16px 20px; border-radius: 8px; }
+
+  /* ── CONNECT CODE ── */
+  .connect-code-display { font-family: var(--font-display); font-size: 64px; font-weight: 800; letter-spacing: 16px; color: #fff; background: var(--surface2); border: 1px solid var(--border-bright); padding: 24px; border-radius: 12px; text-align: center; margin-bottom: 10px; transition: border-color 0.3s; }
+  .connect-code-display.connected { border-color: rgba(255,255,255,0.5); }
+
+  @media (max-width: 600px) {
+    #topbar { padding: 10px 14px; }
+    #nav { padding: 0 10px; overflow-x: auto; }
+    .tab-panel { padding: 16px; }
+    .profile-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  /* ── MEMORY BAR ── */
+  .mem-bar-wrap {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 12px; border: 1px solid var(--border);
+    background: var(--surface); border-radius: 6px;
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--text-dimmer); letter-spacing: 1px;
+    cursor: default; transition: all 0.3s;
+  }
+  .mem-bar-wrap.warn { border-color: rgba(240,192,64,0.4); color: var(--warn); }
+  .mem-bar-wrap.crit { border-color: rgba(255,59,59,0.5); color: #ff6b6b; animation: pulse-border 1s infinite; }
+  @keyframes pulse-border { 0%,100%{border-color:rgba(255,59,59,0.5)} 50%{border-color:rgba(255,59,59,0.9)} }
+  .mem-track { width: 60px; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden; }
+  .mem-fill { height: 100%; border-radius: 2px; background: rgba(255,255,255,0.5); transition: width 0.5s, background 0.5s; }
+  .mem-fill.warn { background: var(--warn); }
+  .mem-fill.crit { background: #ff5f5f; }
+  .degraded-tag {
+    padding: 2px 6px; font-size: 9px; letter-spacing: 1px;
+    background: rgba(255,59,59,0.15); color: #ff6b6b;
+    border: 1px solid rgba(255,59,59,0.3); border-radius: 3px;
+    animation: pulse-dot 1s infinite;
+  }
+
+  /* ── FLOATING LOG BUTTON ── */
+  #log-float-btn {
+    position: fixed; right: 0; top: 50%; transform: translateY(-50%);
+    width: 22px; height: 60px; background: var(--surface2);
+    border: 1px solid var(--border); border-right: none;
+    border-radius: 6px 0 0 6px; cursor: pointer; z-index: 300;
+    display: flex; align-items: center; justify-content: center;
+    writing-mode: vertical-rl; font-family: var(--font-mono);
+    font-size: 8px; color: var(--text-dimmer); letter-spacing: 2px;
+    text-transform: uppercase; transition: all 0.2s;
+  }
+  #log-float-btn:hover { background: var(--surface3); color: var(--text); border-color: rgba(255,255,255,0.15); }
+  #log-float-btn.debug-on { color: #ff5f5f; border-color: rgba(255,59,59,0.3); }
+
+  /* ── FLOATING LOG WINDOW ── */
+  #log-float-panel {
+    position: fixed; right: 22px; top: 50%;
+    transform: translateY(-50%);
+    width: 420px; max-height: 60vh;
+    background: rgba(10,10,10,0.97);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 10px; z-index: 299;
+    display: none; flex-direction: column;
+    box-shadow: -8px 0 40px rgba(0,0,0,0.6);
+    backdrop-filter: blur(16px);
+    animation: slideInRight 0.2s ease;
+  }
+  #log-float-panel.open { display: flex; }
+  @keyframes slideInRight { from{opacity:0;transform:translateY(-50%) translateX(20px)} to{opacity:1;transform:translateY(-50%) translateX(0)} }
+
+  .log-panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .log-panel-title { font-family: var(--font-display); font-size: 12px; font-weight: 700; letter-spacing: 2px; color: #fff; }
+  .log-panel-controls { display: flex; gap: 6px; align-items: center; }
+  .log-panel-controls select { background: var(--surface2); border: 1px solid var(--border); color: var(--text-dim); padding: 3px 6px; font-family: var(--font-mono); font-size: 9px; border-radius: 4px; }
+
+  .log-entries {
+    flex: 1; overflow-y: auto; padding: 8px;
+    font-family: var(--font-mono); font-size: 10px;
+    line-height: 1.6;
+  }
+  .log-entry { padding: 3px 6px; border-radius: 3px; margin-bottom: 2px; display: flex; gap: 8px; }
+  .log-entry:hover { background: rgba(255,255,255,0.03); }
+  .log-ts { color: var(--text-dimmer); flex-shrink: 0; }
+  .log-src { color: rgba(255,255,255,0.35); flex-shrink: 0; min-width: 60px; }
+  .log-lvl { flex-shrink: 0; min-width: 52px; font-weight: 700; }
+  .log-msg { color: var(--text-dim); word-break: break-all; }
+  .log-lvl.INFO    { color: rgba(200,200,200,0.8); }
+  .log-lvl.DEBUG   { color: rgba(150,180,255,0.8); }
+  .log-lvl.WARN    { color: var(--warn); }
+  .log-lvl.ERROR   { color: #ff5f5f; }
+  .log-lvl.ARCHIVE { color: rgba(100,255,160,0.8); }
+  .log-lvl.DM      { color: rgba(200,150,255,0.8); }
+  .log-lvl.NETWORK { color: rgba(100,200,255,0.8); }
+  .log-lvl.MEMORY  { color: rgba(255,180,100,0.8); }
+
+  /* ── DEBUG PANEL IN SETTINGS ── */
+  .debug-section { margin-top: 20px; }
+  .debug-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  .debug-stat { background: var(--surface2); border: 1px solid var(--border); padding: 12px 14px; border-radius: 8px; }
+  .debug-stat-val { font-family: var(--font-display); font-size: 22px; font-weight: 800; color: #fff; }
+  .debug-stat-lbl { font-family: var(--font-mono); font-size: 9px; color: var(--text-dimmer); letter-spacing: 1px; text-transform: uppercase; margin-top: 3px; }
+  .debug-log-box {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; height: 260px; overflow-y: auto;
+    font-family: var(--font-mono); font-size: 10px;
+    padding: 8px;
+  }
+
+  /* ── SAVE-ACCOUNT POPUP ── */
+  #save-account-popup {
+    position: fixed; bottom: 28px; right: 28px; z-index: 1200;
+    width: 320px;
+    background: var(--surface); border: 1px solid var(--border-bright);
+    border-radius: 12px; box-shadow: 0 8px 40px rgba(0,0,0,0.7);
+    padding: 18px 20px 16px;
+    transform: translateY(20px); opacity: 0;
+    transition: transform 0.28s cubic-bezier(0.22,1,0.36,1), opacity 0.28s ease;
+    pointer-events: none;
+  }
+  #save-account-popup.visible {
+    transform: translateY(0); opacity: 1; pointer-events: all;
+  }
+  .save-popup-header {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+  }
+  .save-popup-avatar {
+    width: 38px; height: 38px; border-radius: 50%;
+    border: 1px solid var(--border-bright); overflow: hidden;
+    background: var(--surface3); flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-display); font-weight: 800; font-size: 14px;
+    color: rgba(255,255,255,0.5);
+  }
+  .save-popup-avatar img { width: 100%; height: 100%; object-fit: cover; }
+  .save-popup-title {
+    font-family: var(--font-display); font-size: 13px;
+    font-weight: 700; letter-spacing: 1px; color: #fff;
+  }
+  .save-popup-sub {
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--text-dimmer); margin-top: 2px;
+  }
+  .save-popup-question {
+    font-family: var(--font-mono); font-size: 11px;
+    color: var(--text-dim); margin-bottom: 14px; line-height: 1.6;
+  }
+  .save-popup-btns {
+    display: flex; gap: 8px;
+  }
+  .save-popup-btns .btn {
+    flex: 1; padding: 8px 0; font-size: 12px; justify-content: center;
+  }
+
+  /* ── COOKIE SAVE MODE SELECTOR (Settings) ── */
+  .save-mode-options {
+    display: flex; flex-direction: column; gap: 8px; margin-top: 10px;
+  }
+  .save-mode-option {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface2); cursor: pointer;
+    transition: border-color 0.18s, background 0.18s;
+  }
+  .save-mode-option:hover { border-color: rgba(255,255,255,0.18); }
+  .save-mode-option.active {
+    border-color: rgba(255,255,255,0.5);
+    background: rgba(255,255,255,0.05);
+  }
+  .save-mode-dot {
+    width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.25);
+    flex-shrink: 0; margin-top: 1px;
+    display: flex; align-items: center; justify-content: center;
+    transition: border-color 0.18s;
+  }
+  .save-mode-option.active .save-mode-dot {
+    border-color: #fff;
+  }
+  .save-mode-dot::after {
+    content: ''; width: 7px; height: 7px; border-radius: 50%;
+    background: #fff; display: none;
+  }
+  .save-mode-option.active .save-mode-dot::after { display: block; }
+  .save-mode-label { font-size: 13px; font-weight: 600; color: var(--text); }
+  .save-mode-desc  { font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer); margin-top: 2px; line-height: 1.5; }
+
+  /* ══════════════════════════════════════════════════
+     SENTINEL ANIMATION LAYER — injected
+  ══════════════════════════════════════════════════ */
+
+  /* ── BOOT SPLASH ── */
+  #boot-splash {
+    position: fixed; inset: 0; z-index: 9998;
+    background: #000; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  #boot-splash.fade-out {
+    animation: splash-exit 0.8s cubic-bezier(0.4,0,0.2,1) forwards;
+  }
+  @keyframes splash-exit {
+    0%   { opacity:1; transform:scale(1); }
+    60%  { opacity:1; transform:scale(1.02); }
+    100% { opacity:0; transform:scale(0.97); pointer-events:none; }
+  }
+
+  #boot-scanline-sweep {
+    position: absolute; top: -100%; left: 0; right: 0; height: 60%;
+    background: linear-gradient(180deg,
+      transparent 0%,
+      rgba(255,255,255,0.012) 40%,
+      rgba(255,255,255,0.025) 50%,
+      rgba(255,255,255,0.012) 60%,
+      transparent 100%);
+    animation: boot-sweep 1.4s ease-in-out 0.2s;
+    pointer-events: none;
+  }
+  @keyframes boot-sweep {
+    from { top: -60%; } to { top: 100%; }
+  }
+
+  #boot-logo-wrap {
+    text-align: center; position: relative;
+  }
+  #boot-logo-text {
+    font-family: var(--font-display); font-size: clamp(42px,9vw,90px);
+    font-weight: 800; letter-spacing: clamp(8px,2vw,20px);
+    color: #fff; position: relative; display: inline-block;
+    animation: boot-logo-in 0.6s cubic-bezier(0.16,1,0.3,1) 0.1s both;
+  }
+  @keyframes boot-logo-in {
+    from { opacity:0; transform:translateY(30px) scaleX(0.8); letter-spacing: 2px; }
+    to   { opacity:1; transform:translateY(0) scaleX(1); }
+  }
+
+  #boot-logo-text.glitching::before,
+  #boot-logo-text.glitching::after {
+    content: attr(data-text);
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    font-family: var(--font-display); font-size: inherit;
+    font-weight: 800; letter-spacing: inherit;
+  }
+  #boot-logo-text.glitching::before {
+    color: #ff3b3b; animation: glitch-1 0.15s infinite;
+    clip-path: polygon(0 20%, 100% 20%, 100% 40%, 0 40%);
+  }
+  #boot-logo-text.glitching::after {
+    color: rgba(100,200,255,0.8); animation: glitch-2 0.15s infinite;
+    clip-path: polygon(0 60%, 100% 60%, 100% 80%, 0 80%);
+  }
+  @keyframes glitch-1 {
+    0%,100%{transform:translate(0)} 33%{transform:translate(-4px,1px)} 66%{transform:translate(4px,-1px)}
+  }
+  @keyframes glitch-2 {
+    0%,100%{transform:translate(0)} 33%{transform:translate(3px,-2px)} 66%{transform:translate(-3px,2px)}
+  }
+
+  #boot-tagline {
+    font-family: var(--font-mono); font-size: clamp(9px,1.2vw,12px);
+    color: rgba(255,255,255,0.35); letter-spacing: 4px; text-transform: uppercase;
+    margin-top: 14px;
+    animation: boot-tag-in 0.5s ease 0.55s both;
+  }
+  @keyframes boot-tag-in { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
+
+  #boot-progress-wrap {
+    margin-top: 52px; width: clamp(200px,30vw,320px);
+    animation: boot-tag-in 0.5s ease 0.65s both;
+  }
+  #boot-progress-bar {
+    height: 1px; background: rgba(255,255,255,0.08);
+    border-radius: 1px; overflow: hidden; position: relative;
+  }
+  #boot-progress-fill {
+    height: 100%; width: 0%; background: rgba(255,255,255,0.7);
+    border-radius: 1px; transition: width 0.08s linear;
+    box-shadow: 0 0 8px rgba(255,255,255,0.4);
+  }
+  #boot-status-text {
+    font-family: var(--font-mono); font-size: 10px;
+    color: rgba(255,255,255,0.3); letter-spacing: 2px;
+    margin-top: 10px; text-align: left;
+    min-height: 16px;
+  }
+
+  #boot-corners .bc { position: absolute; width: 32px; height: 32px; }
+  #boot-corners .bc::before, #boot-corners .bc::after {
+    content:''; position:absolute; background:rgba(255,255,255,0.4);
+    animation: bc-in 0.4s ease 0.05s both;
+  }
+  @keyframes bc-in { from{transform:scaleX(0)} to{transform:scaleX(1)} }
+  #boot-corners .bc.tl { top:20px;left:20px; }
+  #boot-corners .bc.tl::before{top:0;left:0;width:24px;height:1px;}
+  #boot-corners .bc.tl::after{top:0;left:0;width:1px;height:24px;animation:bc-v 0.4s ease 0.1s both;}
+  #boot-corners .bc.tr { top:20px;right:20px; }
+  #boot-corners .bc.tr::before{top:0;right:0;width:24px;height:1px;}
+  #boot-corners .bc.tr::after{top:0;right:0;width:1px;height:24px;animation:bc-v 0.4s ease 0.1s both;}
+  #boot-corners .bc.bl { bottom:20px;left:20px; }
+  #boot-corners .bc.bl::before{bottom:0;left:0;width:24px;height:1px;}
+  #boot-corners .bc.bl::after{bottom:0;left:0;width:1px;height:24px;animation:bc-v 0.4s ease 0.1s both;}
+  #boot-corners .bc.br { bottom:20px;right:20px; }
+  #boot-corners .bc.br::before{bottom:0;right:0;width:24px;height:1px;}
+  #boot-corners .bc.br::after{bottom:0;right:0;width:1px;height:24px;animation:bc-v 0.4s ease 0.1s both;}
+  @keyframes bc-v { from{transform:scaleY(0)} to{transform:scaleY(1)} }
+
+  /* ── MOUSE-REACTIVE GRID ── */
+  #grid-glow-canvas {
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    mix-blend-mode: screen; opacity: 0.85;
+  }
+
+  /* ── PARTICLE FIELD ── */
+  #particle-canvas {
+    position: fixed; inset: 0; pointer-events: none; z-index: 0; opacity: 0.6;
+  }
+
+  /* ── CUSTOM CURSOR ── */
+  #cursor-dot {
+    position: fixed; width: 6px; height: 6px; border-radius: 50%;
+    background: #fff; pointer-events: none; z-index: 99999;
+    transform: translate(-50%,-50%);
+    transition: transform 0.1s, opacity 0.2s;
+    mix-blend-mode: difference;
+  }
+  #cursor-ring {
+    position: fixed; width: 32px; height: 32px; border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.4); pointer-events: none;
+    z-index: 99998; transform: translate(-50%,-50%);
+    transition: width 0.25s, height 0.25s, border-color 0.25s, opacity 0.3s;
+    mix-blend-mode: difference;
+  }
+  #cursor-ring.hovering {
+    width: 48px; height: 48px; border-color: rgba(255,255,255,0.7);
+  }
+  body { cursor: none; }
+
+  /* ── ENHANCED TAB TRANSITIONS ── */
+  .tab-panel {
+    animation: none !important;
+  }
+  .tab-panel.tab-enter {
+    animation: tab-slide-in 0.3s cubic-bezier(0.16,1,0.3,1) both !important;
+  }
+  .tab-panel.tab-exit {
+    animation: tab-slide-out 0.25s cubic-bezier(0.4,0,1,1) both !important;
+  }
+  @keyframes tab-slide-in {
+    from { opacity:0; transform:translateY(12px) scale(0.99); }
+    to   { opacity:1; transform:none; }
+  }
+  @keyframes tab-slide-out {
+    from { opacity:1; }
+    to   { opacity:0; transform:translateY(-6px); }
+  }
+
+  /* ── NAV TAB INDICATOR ── */
+  #nav-indicator {
+    position: absolute; bottom: -1px; height: 2px;
+    background: #fff; border-radius: 1px;
+    transition: left 0.3s cubic-bezier(0.16,1,0.3,1), width 0.3s cubic-bezier(0.16,1,0.3,1);
+    box-shadow: 0 0 12px rgba(255,255,255,0.6);
+    pointer-events: none;
+  }
+  #nav { position: relative; }
+
+  /* ── PROFILE SCREEN ENTRANCE ── */
+  #profile-screen .profile-screen-logo {
+    animation: ps-logo-in 0.7s cubic-bezier(0.16,1,0.3,1) 0.1s both;
+  }
+  @keyframes ps-logo-in {
+    from { opacity:0; transform:translateY(-20px); }
+    to   { opacity:1; transform:none; }
+  }
+  .profile-card {
+    opacity: 0;
+    animation: card-pop-in 0.5s cubic-bezier(0.16,1,0.3,1) both;
+  }
+  @keyframes card-pop-in {
+    from { opacity:0; transform:translateY(18px) scale(0.95); }
+    to   { opacity:1; transform:none; }
+  }
+
+  /* ── STAT CARD GLOW ── */
+  .stat-card {
+    transition: border-color 0.3s, box-shadow 0.3s, transform 0.25s;
+    position: relative; overflow: hidden;
+  }
+  .stat-card::before {
+    content: ''; position: absolute; inset: 0; opacity: 0;
+    background: radial-gradient(ellipse at 50% 0%, rgba(255,255,255,0.06) 0%, transparent 70%);
+    transition: opacity 0.3s;
+  }
+  .stat-card:hover { transform: translateY(-3px); box-shadow: 0 12px 40px rgba(0,0,0,0.5); border-color: rgba(255,255,255,0.18); }
+  .stat-card:hover::before { opacity: 1; }
+
+  /* ── CARD 3D TILT ── */
+  .card { transform-style: preserve-3d; will-change: transform; }
+
+  /* ── BUTTON RIPPLE ── */
+  .btn { position: relative; overflow: hidden; }
+  .btn-ripple {
+    position: absolute; border-radius: 50%;
+    background: rgba(255,255,255,0.15);
+    transform: scale(0); animation: ripple-out 0.55s ease-out forwards;
+    pointer-events: none;
+  }
+  @keyframes ripple-out {
+    to { transform:scale(4); opacity:0; }
+  }
+
+  /* ── LOGO GLOW PULSE ── */
+  .logo-text {
+    animation: logo-glow 4s ease-in-out infinite;
+  }
+  @keyframes logo-glow {
+    0%,100% { text-shadow: none; }
+    50%      { text-shadow: 0 0 24px rgba(255,255,255,0.2), 0 0 48px rgba(255,255,255,0.08); }
+  }
+
+  /* ── TOPBAR ENTRANCE ── */
+  #topbar { animation: topbar-in 0.5s cubic-bezier(0.16,1,0.3,1) 0.05s both; }
+  @keyframes topbar-in {
+    from { opacity:0; transform:translateY(-16px); }
+    to   { opacity:1; transform:none; }
+  }
+  #nav { animation: topbar-in 0.5s cubic-bezier(0.16,1,0.3,1) 0.12s both; }
+
+  /* ── TOAST ENHANCEMENT ── */
+  .toast { border-left-width: 3px !important; }
+  @keyframes toast-in {
+    from { opacity:0; transform:translateX(30px) scale(0.95); }
+    to   { opacity:1; transform:none; }
+  }
+
+  /* ── SCANLINE OVERLAY ── */
+  #scanlines {
+    position: fixed; inset: 0; pointer-events: none; z-index: 9997;
+    background-image: repeating-linear-gradient(
+      0deg,
+      transparent, transparent 2px,
+      rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px
+    );
+    opacity: 0.5;
+  }
+
+  /* ── WELCOME TOAST ── */
+  #welcome-toast {
+    position: fixed; top: 80px; left: 50%; transform: translateX(-50%) translateY(-20px);
+    z-index: 8000; opacity: 0;
+    background: rgba(15,15,15,0.95); border: 1px solid rgba(255,255,255,0.12);
+    backdrop-filter: blur(20px); border-radius: 12px;
+    padding: 14px 24px; text-align: center;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05);
+    transition: opacity 0.4s, transform 0.4s cubic-bezier(0.16,1,0.3,1);
+    white-space: nowrap;
+  }
+  #welcome-toast.show {
+    opacity: 1; transform: translateX(-50%) translateY(0);
+  }
+  #welcome-toast-name {
+    font-family: var(--font-display); font-size: 15px; font-weight: 700;
+    letter-spacing: 2px; color: #fff;
+  }
+  #welcome-toast-sub {
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer);
+    letter-spacing: 2px; margin-top: 4px;
+  }
+
+  /* ── MODAL ENHANCED ENTRANCE ── */
+  .modal-box {
+    animation: modal-in 0.3s cubic-bezier(0.16,1,0.3,1) both !important;
+  }
+  @keyframes modal-in {
+    from { opacity:0; transform:scale(0.94) translateY(16px); }
+    to   { opacity:1; transform:none; }
+  }
+
+  /* ── HISTORY ITEM ENTRANCE ── */
+  .history-item {
+    animation: hist-in 0.4s cubic-bezier(0.16,1,0.3,1) both;
+  }
+  @keyframes hist-in {
+    from { opacity:0; transform:translateX(-10px); }
+    to   { opacity:1; transform:none; }
+  }
+
+  /* ── PROFILE SCREEN LOGO GLITCH ── */
+  .big-logo {
+    position: relative; display: inline-block;
+    animation: logo-glow 5s ease-in-out infinite;
+  }
+  .big-logo.glitching::before, .big-logo.glitching::after {
+    content: attr(data-text); position: absolute; top:0;left:0;
+    font-family:inherit; font-size:inherit; font-weight:inherit;
+    letter-spacing:inherit; color:inherit;
+  }
+  .big-logo.glitching::before {
+    color:#ff3b3b; animation:glitch-1 0.12s infinite;
+    clip-path:polygon(0 15%,100% 15%,100% 35%,0 35%);
+  }
+  .big-logo.glitching::after {
+    color:rgba(100,200,255,0.8); animation:glitch-2 0.12s infinite;
+    clip-path:polygon(0 65%,100% 65%,100% 85%,0 85%);
+  }
+
+  /* ── CORNER DECOR ANIMATION ── */
+  .corner-decor::before, .corner-decor::after {
+    transition: background 0.5s;
+  }
+  .corner-decor-pulse::before, .corner-decor-pulse::after {
+    background: rgba(255,255,255,0.7) !important;
+    box-shadow: 0 0 8px rgba(255,255,255,0.4);
+  }
+
+  /* ── RESTORE TOOLBAR ── */
+  #restore-toolbar {
+    display: none; align-items: center; gap: 12px;
+    padding: 10px 16px; background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; margin-bottom: 14px; flex-wrap: wrap;
+  }
+  #restore-toolbar.visible { display: flex; }
+  .restore-count-label { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); flex: 1; min-width: 120px; }
+  #restore-progress { font-family: var(--font-mono); font-size: 10px; color: rgba(255,255,255,0.4); display: none; }
+  .history-check {
+    width: 18px; height: 18px; border: 1px solid var(--border); border-radius: 4px;
+    cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s; background: transparent; color: transparent; font-size: 11px;
+  }
+  .history-check.checked { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.35); color: #fff; }
+  .history-check:hover { border-color: rgba(255,255,255,0.3); }
+  .btn-restore {
+    padding: 5px 13px; font-family: var(--font-display); font-size: 10px; font-weight: 700;
+    letter-spacing: 1px; text-transform: uppercase; cursor: pointer;
+    border: 1px solid rgba(100,200,150,0.3); background: rgba(100,200,150,0.06);
+    color: rgba(140,230,180,0.85); border-radius: 5px; transition: all 0.2s; white-space: nowrap;
+  }
+  .btn-restore:hover { background: rgba(100,200,150,0.14); border-color: rgba(100,200,150,0.5); color: #a0f0c0; }
+  .btn-restore:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-restore.restored { border-color: rgba(100,200,150,0.15); color: rgba(140,230,180,0.35); cursor: default; background: transparent; }
+  .badge-restored {
+    background: rgba(100,200,150,0.1); color: rgba(140,230,180,0.7);
+    border: 1px solid rgba(100,200,150,0.2); padding: 3px 10px;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 1px;
+    border-radius: 2px; text-transform: uppercase;
+  }
+
+
+  /* ── MONITOR HEALTH BANNER ── */
+  #monitor-health-banner {
+    display: none; align-items: center; gap: 12px;
+    padding: 11px 18px;
+    background: rgba(255,160,50,0.07);
+    border: 1px solid rgba(255,160,50,0.25);
+    border-radius: 8px;
+    margin-bottom: 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: rgba(255,190,80,0.9);
+  }
+  #monitor-health-banner.visible { display: flex; }
+  #monitor-health-banner .mhb-icon { font-size: 15px; flex-shrink: 0; }
+  #monitor-health-banner .mhb-msg  { flex: 1; line-height: 1.5; }
+  #monitor-health-banner .mhb-restart {
+    padding: 5px 14px; font-family: var(--font-display); font-size: 10px;
+    font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
+    border: 1px solid rgba(255,160,50,0.35); background: rgba(255,160,50,0.08);
+    color: rgba(255,190,80,0.9); border-radius: 5px; cursor: pointer;
+    transition: all 0.2s; white-space: nowrap;
+  }
+  #monitor-health-banner .mhb-restart:hover { background: rgba(255,160,50,0.16); }
+
+  /* ── SANITY CHECK INDICATOR ── */
+  #sanity-indicator {
+    display: none; align-items: center; gap: 7px;
+    padding: 5px 12px; border: 1px solid var(--border);
+    background: var(--surface); border-radius: 6px;
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--text-dimmer); letter-spacing: 1px;
+    cursor: default; transition: all 0.3s;
+  }
+  #sanity-indicator.visible { display: flex; }
+  #sanity-indicator.running {
+    border-color: rgba(240,192,64,0.3);
+    background: rgba(240,192,64,0.05);
+    color: rgba(240,192,64,0.8);
+  }
+  .sanity-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--text-dimmer); flex-shrink: 0;
+  }
+  #sanity-indicator.running .sanity-dot {
+    background: rgba(240,192,64,0.8);
+    animation: pulse-dot 1s infinite;
+  }
+
+  /* ── COOKIE EXPIRED ACCOUNT STATES ── */
+  .cookie-expired-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 8px; background: rgba(255,59,59,0.1);
+    border: 1px solid rgba(255,59,59,0.3);
+    color: #ff6b6b; font-family: var(--font-mono);
+    font-size: 9px; letter-spacing: 1px; border-radius: 3px;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .account-row-expired {
+    opacity: 0.55;
+    pointer-events: none;
+  }
+  .account-row-expired .use-btn {
+    pointer-events: none !important;
+    border-color: rgba(255,59,59,0.2) !important;
+    color: #ff6b6b !important;
+    background: rgba(255,59,59,0.04) !important;
+    cursor: not-allowed !important;
+  }
+
+  /* ── PHASE 2 ACTIVITY CHECK — monitor toggle lockout ── */
+  #activity-check-row {
+    display: none; align-items: center; gap: 10px;
+    margin-top: 2px; margin-bottom: 8px;
+    padding: 8px 12px;
+    background: rgba(240,192,64,0.05);
+    border: 1px solid rgba(240,192,64,0.2);
+    border-radius: 6px;
+  }
+  #activity-check-row.visible { display: flex; }
+  .activity-check-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: rgba(240,192,64,0.8);
+    flex-shrink: 0;
+    animation: pulse-dot 0.8s infinite;
+  }
+  .activity-check-label {
+    font-family: var(--font-mono); font-size: 10px;
+    color: rgba(240,192,64,0.9); letter-spacing: 1px;
+    flex: 1;
+  }
+  .activity-check-countdown {
+    font-family: var(--font-display); font-size: 14px;
+    font-weight: 800; color: rgba(240,192,64,0.9);
+    min-width: 18px; text-align: center;
+  }
+  /* grayed toggle during phase 2 */
+  .toggle-sw.phase2-locked {
+    opacity: 0.35 !important;
+    pointer-events: none !important;
+    cursor: not-allowed !important;
+  }
+
+</style>
+<body>
+
+<!-- ── CRASH RECOVERY OVERLAY ── -->
+<div id="crash-overlay" class="hidden">
+  <div class="crash-box">
+    <div class="crash-dot" id="crash-dot"></div>
+    <div class="crash-title">SENTINEL</div>
+    <div class="crash-sub" id="crash-sub">Critical Error</div>
+    <div class="crash-msg" id="crash-msg">Sentinel has encountered a critical error and is automatically repairing itself.</div>
+    <div class="crash-bar"><div class="crash-bar-fill" id="crash-bar-fill"></div></div>
+    <div class="crash-status" id="crash-status">Diagnosing issue…</div>
+  </div>
+</div>
+
+<!-- ── VIDEO BACKGROUND ── -->
+<video id="bg-video" autoplay muted loop playsinline>
+  <source src="https://pub-a17495cad61f41da8d8e455e1292573b.r2.dev/bg.mp4" type="video/mp4">
+</video>
+<div id="bg-overlay"></div>
+
+<!-- ── MIGRATION NOTICE POPUP ── -->
+<div id="migration-popup" class="hidden">
+  <div id="migration-popup-box">
+    <div class="mig-tag">⚠ UPCOMING CHANGES</div>
+    <h2>SENTINEL IS GOING PUBLIC</h2>
+    <p>
+      Sentinel is evolving into a full platform with proper accounts, subscriptions, and public access.
+      The current profile system is going away, here's what's changing:
+    </p>
+    <div class="mig-highlight">
+      <ul>
+        <li>Profiles will be migrated to standard email + password accounts</li>
+        <li>Account creation will be free.</li>
+        <li>Subscription plans will unlock full Sentinel access</li>
+        <li>The profile selector screen will be replaced by a proper login page</li>
+      </ul>
+    </div>
+    <div class="mig-lifetime">
+      ✓ &nbsp;All current users get free access :p.
+    </div>
+    <p style="margin-bottom:22px;">
+      Nothing is changing right now. Keep using Sentinel as normal.
+    </p>
+    <button id="migration-popup-ok" onclick="dismissMigrationPopup()">GOT IT</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════
+     SENTINEL VAULT — Ctrl+Shift+B  (works on any screen)
+══════════════════════════════════════════════════ -->
+<div id="vault-overlay" style="
+  display:none; position:fixed; inset:0; z-index:99999;
+  background:rgba(0,0,0,0.88); backdrop-filter:blur(12px);
+  align-items:center; justify-content:center; padding:20px;
+">
+  <div id="vault-box" style="
+    background:#0d0d0d; border:1px solid rgba(255,255,255,0.15);
+    border-radius:16px; width:100%; max-width:500px;
+    box-shadow:0 32px 80px rgba(0,0,0,0.8), 0 0 0 1px rgba(255,255,255,0.05);
+    overflow:hidden; font-family:'Space Grotesk',sans-serif;
+  ">
+    <!-- Header -->
+    <div style="
+      padding:20px 24px 16px; border-bottom:1px solid rgba(255,255,255,0.08);
+      display:flex; align-items:center; justify-content:space-between;
+    ">
+      <div>
+        <div style="font-family:'Share Tech Mono',monospace; font-size:10px; letter-spacing:4px; color:rgba(255,255,255,0.35); margin-bottom:4px;">SENTINEL</div>
+        <div style="font-size:16px; font-weight:700; color:#fff; letter-spacing:1px;">Database Vault</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:rgba(255,255,255,0.3);letter-spacing:2px;">Ctrl+Shift+B</div>
+        <button onclick="vaultClose()" style="
+          background:none;border:1px solid rgba(255,255,255,0.12);color:rgba(255,255,255,0.5);
+          width:28px;height:28px;border-radius:6px;cursor:pointer;font-size:14px;
+          display:flex;align-items:center;justify-content:center;transition:all 0.2s;
+        " onmouseover="this.style.borderColor='rgba(255,100,100,0.5)';this.style.color='#ff6b6b'"
+           onmouseout="this.style.borderColor='rgba(255,255,255,0.12)';this.style.color='rgba(255,255,255,0.5)'">✕</button>
+      </div>
+    </div>
+
+    <!-- Master key input -->
+    <div style="padding:20px 24px 0;">
+      <div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:2px;margin-bottom:8px;">MASTER KEY</div>
+      <div style="display:flex;gap:8px;">
+        <input id="vault-key-input" type="password" placeholder="Enter SENTINEL_MASTER_KEY..."
+          style="
+            flex:1;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);
+            border-radius:8px;padding:10px 14px;color:#fff;font-family:'Share Tech Mono',monospace;
+            font-size:12px;outline:none;transition:border-color 0.2s;
+          "
+          onfocus="this.style.borderColor='rgba(255,255,255,0.3)'"
+          onblur="this.style.borderColor='rgba(255,255,255,0.1)'"
+          onkeydown="if(event.key==='Enter')vaultExport()"
+        >
+        <button onclick="vaultToggleKeyVis()" title="Show/hide" style="
+          background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);
+          color:rgba(255,255,255,0.4);border-radius:8px;padding:0 12px;cursor:pointer;font-size:14px;
+        ">👁</button>
+      </div>
+      <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:rgba(255,255,255,0.25);margin-top:6px;">
+        Set SENTINEL_MASTER_KEY on Render · Check startup logs if not set
+      </div>
+    </div>
+
+    <!-- Action buttons -->
+    <div style="padding:16px 24px; display:flex; gap:10px; flex-wrap:wrap;">
+      <button onclick="vaultExport()" id="vault-btn-export" style="
+        flex:1;min-width:120px;padding:11px 16px;border-radius:8px;cursor:pointer;
+        background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.15);
+        color:#fff;font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:1px;
+        transition:all 0.2s;
+      " onmouseover="this.style.background='rgba(255,255,255,0.12)'"
+         onmouseout="this.style.background='rgba(255,255,255,0.07)'">⬇ EXPORT BACKUP</button>
+
+      <label id="vault-btn-import" style="
+        flex:1;min-width:120px;padding:11px 16px;border-radius:8px;cursor:pointer;
+        background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.15);
+        color:#fff;font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:1px;
+        transition:all 0.2s;text-align:center;
+      " onmouseover="this.style.background='rgba(255,255,255,0.12)'"
+         onmouseout="this.style.background='rgba(255,255,255,0.07)'">
+        ⬆ IMPORT BACKUP
+        <input type="file" id="vault-file-input" accept=".json,application/json" style="display:none" onchange="vaultImport(this)">
+      </label>
+    </div>
+
+    <!-- Status log -->
+    <div id="vault-log" style="
+      margin:0 24px 20px; background:rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.07);
+      border-radius:8px; padding:12px 14px; min-height:64px; max-height:180px; overflow-y:auto;
+      display:none;
+    ">
+      <div id="vault-log-inner" style="font-family:'Share Tech Mono',monospace;font-size:10px;line-height:1.8;color:rgba(255,255,255,0.5);"></div>
+    </div>
+
+    <!-- Auto-restore hint -->
+    <div style="
+      padding:12px 24px 18px; border-top:1px solid rgba(255,255,255,0.06);
+      font-family:'Share Tech Mono',monospace;font-size:9px;color:rgba(255,255,255,0.2);
+      line-height:1.6;
+    ">
+      AUTO-RESTORE: set VAULT_AUTO_RESTORE_URL to a raw URL of your latest export.<br>
+      On startup with an empty DB, Sentinel fetches and restores automatically.
     </div>
   </div>
-  <table style="width:100%;border-collapse:collapse;margin-bottom:12px;">
-    <tr><td style="color:#888;padding:4px 0;width:140px;font-size:12px;">Switched To</td><td style="color:#fff;font-weight:600;">{new_name}</td></tr>
-    <tr><td style="color:#888;padding:4px 0;font-size:12px;">New Account UID</td><td style="color:#aaa;font-size:12px;">{new_uid}</td></tr>
-  </table>"""
-    else:
-        subject     = "[SENTINEL] ⚠ Cookie Expired — No Valid Account — Monitoring INACTIVE"
-        status_block = f"""
-  <div style="background:rgba(255,59,59,0.1);border:1px solid rgba(255,59,59,0.3);border-radius:8px;padding:16px;margin-bottom:20px;">
-    <div style="color:#ff6b6b;font-weight:700;font-size:14px;letter-spacing:2px;margin-bottom:8px;">⚠ NO VALID FALLBACK ACCOUNT</div>
-    <div style="color:#ccc;font-size:13px;line-height:1.6;">
-      The active cookie expired and Sentinel found <strong style="color:#ff6b6b;">no other saved accounts with a valid cookie</strong> to automatically switch to.
-      Monitoring is now <strong style="color:#ff6b6b;">INACTIVE</strong> and will not resume until you re-add a valid account.
+</div>
+
+<!-- ── SCANLINES ── -->
+<div id="scanlines"></div>
+
+<!-- ── CUSTOM CURSOR ── -->
+<div id="cursor-dot"></div>
+<div id="cursor-ring"></div>
+
+<!-- ── PARTICLE + GRID GLOW CANVASES ── -->
+<canvas id="particle-canvas"></canvas>
+<canvas id="grid-glow-canvas"></canvas>
+
+<!-- ── WELCOME TOAST ── -->
+<div id="welcome-toast">
+  <div id="welcome-toast-name">WELCOME BACK</div>
+  <div id="welcome-toast-sub">SENTINEL ACTIVE · SYSTEMS NOMINAL</div>
+</div>
+
+<!-- ── BOOT SPLASH ── -->
+<div id="boot-splash">
+  <div id="boot-scanline-sweep"></div>
+  <div id="boot-corners">
+    <div class="bc tl"></div><div class="bc tr"></div>
+    <div class="bc bl"></div><div class="bc br"></div>
+  </div>
+  <div id="boot-logo-wrap">
+    <div id="boot-logo-text" data-text="SENTINEL">SENTINEL</div>
+    <div id="boot-tagline">Roblox Asset Moderation System</div>
+    <div id="boot-progress-wrap">
+      <div id="boot-progress-bar"><div id="boot-progress-fill"></div></div>
+      <div id="boot-status-text">INITIALIZING...</div>
     </div>
-  </div>"""
+  </div>
+</div>
 
-    html = f"""
-<div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0f0f0f;color:#fff;padding:32px;border-radius:12px;border:1px solid rgba(255,59,59,0.3);">
-  <h2 style="color:#fff;letter-spacing:4px;margin-top:0;font-size:20px;">SENTINEL</h2>
-  {status_block}
-  <div style="font-family:monospace;font-size:11px;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">Expired Account</div>
-  <table style="width:100%;border-collapse:collapse;margin-bottom:20px;background:rgba(255,255,255,0.03);border-radius:6px;padding:12px;">
-    <tr><td style="color:#888;padding:6px 8px;width:120px;font-size:12px;">Profile ID</td><td style="color:#aaa;font-size:12px;padding:6px 8px;">{profile_id}</td></tr>
-    <tr><td style="color:#888;padding:6px 8px;font-size:12px;">Account</td><td style="color:#fff;font-weight:600;padding:6px 8px;">{username}</td></tr>
-    <tr><td style="color:#888;padding:6px 8px;font-size:12px;">Roblox UID</td><td style="color:#aaa;font-size:12px;padding:6px 8px;">{roblox_user_id}</td></tr>
-    <tr><td style="color:#888;padding:6px 8px;font-size:12px;">Detected At</td><td style="color:#aaa;font-size:12px;padding:6px 8px;">{datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</td></tr>
-  </table>
-  <p style="color:#555;font-size:10px;letter-spacing:1px;">SENTINEL AUTOMATED ALERT · SANITY CHECK SYSTEM · PHASE 1</p>
-</div>"""
-    try:
-        send_email(ADMIN_EMAIL, subject, html)
-    except Exception as e:
-        sentinel_log(f"Failed to send cookie expired email: {e}", "ERROR", "SANITY")
+<!-- ── PROFILE SELECTOR SCREEN ── -->
+<div id="profile-screen">
+  <div class="corner-decor tl"></div><div class="corner-decor tr"></div>
+  <div class="corner-decor bl"></div><div class="corner-decor br"></div>
 
-async def sanity_check_loop():
-    """Background task: run sanity check immediately on startup, then every 5 minutes."""
-    sentinel_log("Running initial sanity check on startup", "INFO", "SANITY")
-    await run_sanity_check()
-    while True:
-        await asyncio.sleep(_SANITY_CHECK_INTERVAL)
-        await run_sanity_check()
+  <div class="profile-screen-logo">
+    <div class="big-logo" data-text="SENTINEL">SENTINEL</div>
+    <div class="big-sub">ROBLOX ASSET MODERATION — SELECT PROFILE</div>
+  </div>
 
-def get_session(profile_id: str) -> ProfileSession:
-    if profile_id not in _sessions:
-        _sessions[profile_id] = ProfileSession()
-        _sessions[profile_id].profile_id = profile_id
-    return _sessions[profile_id]
+  <!-- Migration notice banner -->
+  <div id="profile-migration-banner">
+    <span class="pmb-icon">⚠</span>
+    <span>PROFILES ARE GOING TO HAVE TO GET MIGRATED TO A STANDARD ACCOUNT SOON.</span>
+  </div>
 
-# ── CONNECT CODES (SQLite-backed so they survive Render restarts) ─────────────
+  <div class="profile-grid" id="profile-grid">
+    <!-- filled by JS -->
+  </div>
 
-def generate_connect_code(profile_id: str) -> str:
-    now = time.time()
-    code = ''.join(secrets.choice(string.digits) for _ in range(4))
-    db_exec("DELETE FROM connect_codes WHERE expiry < ?", (now,))
-    db_upsert("connect_codes", ["code"],
-              {"code": code, "profile_id": profile_id, "expiry": now + 300})
-    return code
+  <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:1px;">
+    Click any profile to sign in with your PIN
+  </div>
+</div>
 
-def validate_connect_code(code: str) -> Optional[str]:
-    now = time.time()
-    row = db_exec("SELECT profile_id, expiry FROM connect_codes WHERE code=?", (code,), fetch="one")
-    if not row:
-        return None
-    if now > row["expiry"]:
-        db_exec("DELETE FROM connect_codes WHERE code=?", (code,))
-        return None
-    profile_id = row["profile_id"]
-    db_exec("DELETE FROM connect_codes WHERE code=?", (code,))
-    return profile_id
+<!-- ── EXE ACCOUNT SCREEN ──
+     Two jobs, one screen:
+     1) After PIN entry on an unmigrated profile — "migrate mode" — walks the
+        user through creating/logging into an EXE Account and transfers their
+        profile's data over.
+     2) Standalone, for anyone who has already migrated (returning visit with
+        no valid session, or after signing out) — "resume mode" — just a
+        normal login screen, no PIN, no profile grid, ever again.
+-->
+<div id="exe-screen" class="hidden">
+  <div class="corner-decor tl"></div><div class="corner-decor tr"></div>
+  <div class="corner-decor bl"></div><div class="corner-decor br"></div>
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+  <div class="profile-screen-logo">
+    <div class="big-logo">SENTINEL</div>
+    <div class="big-sub" id="exe-screen-sub">EXE ACCOUNT</div>
+  </div>
 
-DEFAULT_CFG = {
-    "pollingInterval":     60,
-    "allowFastPolling":    False,
-    "archiveDelay":        0,
-    "archiveExisting":     False,
-    "saveCookies":         False,
-    "cookieSaveMode":      "ask",
-    "autoStartMonitoring": False,
-    "assetTypeFilters":    ALL_ASSET_TYPES,
-    "whitelist_Audio":     [],
-    "whitelist_Image":     [],
-    "whitelist_Decal":     [],
-    "whitelist_Video":     [],
-    "whitelist_Mesh":      [],
-    "whitelist_Plugin":    [],
-    "whitelist_Animation": [],
-    "whitelist_Model":     [],
-    "whitelist_Package":   [],
-    "whitelist_all":       [],
+  <div id="exe-screen-box">
+
+    <!-- Migrate-mode banner — only shown when coming from an unmigrated PIN profile -->
+    <div id="exe-migrate-banner" class="hidden" style="text-align:center;margin-bottom:22px;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);line-height:1.7;">
+      <div style="font-family:var(--font-display);font-size:16px;font-weight:800;letter-spacing:2px;color:#fff;margin-bottom:8px;">MIGRATE YOUR PROFILE</div>
+      Create or log in to an EXE Account to move <span id="exe-migrate-profile-name" style="color:#fff;">this profile</span>'s data over — history, groups, config, and saved accounts all come with it. Your old profile is deleted once this completes.
+    </div>
+
+    <!-- ── CREATE ACCOUNT FORM ── -->
+    <div id="exe-form-create">
+      <div style="margin-bottom:14px;">
+        <label class="field-label">Display Name</label>
+        <input type="text" id="exe-c-name" placeholder="e.g. ModerationBot">
+      </div>
+      <div style="margin-bottom:14px;">
+        <label class="field-label">Email</label>
+        <input type="email" id="exe-c-email" placeholder="you@example.com">
+      </div>
+      <div style="margin-bottom:8px;">
+        <label class="field-label">Password</label>
+        <input type="password" id="exe-c-password" placeholder="At least 8 characters">
+      </div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-bottom:20px;line-height:1.6;">
+        Two-step verification is required for accounts created through Sentinel — you'll get a code by email at login. You can turn it off later from the EXE homepage.
+      </div>
+      <div id="exe-c-error" style="font-family:var(--font-mono);font-size:10px;color:#ff6b6b;min-height:14px;margin-bottom:10px;"></div>
+      <button class="btn btn-primary btn-block" id="exe-c-submit" onclick="exeSubmitCreate()">Create EXE Account →</button>
+      <div style="text-align:center;margin-top:16px;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">
+        Already have an account? <a href="javascript:void(0)" onclick="exeShowLogin()" style="color:#fff;text-decoration:underline;">Log in instead</a>
+      </div>
+    </div>
+
+    <!-- ── CHECK-YOUR-EMAIL STATE (after successful registration) ── -->
+    <div id="exe-form-verify" class="hidden" style="text-align:center;padding:10px 0;">
+      <div style="font-size:32px;margin-bottom:12px;">✓</div>
+      <div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:8px;">CHECK YOUR EMAIL</div>
+      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:22px;line-height:1.7;">
+        We sent a verification link to <span id="exe-verify-email" style="color:#fff;"></span>. Verify it, then log in below to finish migrating.
+      </div>
+      <button class="btn btn-primary btn-block" onclick="exeShowLogin(true)">Continue to Login →</button>
+    </div>
+
+    <!-- ── LOGIN FORM ── -->
+    <div id="exe-form-login" class="hidden">
+      <div style="margin-bottom:14px;">
+        <label class="field-label">Email</label>
+        <input type="email" id="exe-l-email" placeholder="you@example.com">
+      </div>
+      <div style="margin-bottom:8px;">
+        <label class="field-label">Password</label>
+        <input type="password" id="exe-l-password" placeholder="••••••••">
+      </div>
+      <div id="exe-l-error" style="font-family:var(--font-mono);font-size:10px;color:#ff6b6b;min-height:14px;margin:10px 0;"></div>
+      <button class="btn btn-primary btn-block" id="exe-l-submit" onclick="exeSubmitLogin()">Log In →</button>
+      <div id="exe-l-create-link" style="text-align:center;margin-top:16px;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">
+        Need an account? <a href="javascript:void(0)" onclick="exeShowCreate()" style="color:#fff;text-decoration:underline;">Create one instead</a>
+      </div>
+    </div>
+
+    <!-- ── 2FA CODE FORM ── -->
+    <div id="exe-form-2fa" class="hidden" style="text-align:center;">
+      <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:2px;margin-bottom:4px;">TWO-STEP VERIFICATION</div>
+      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:18px;">Enter the 6-digit code we emailed you.</div>
+      <input type="text" id="exe-2fa-code" placeholder="000000" maxlength="6" style="text-align:center;letter-spacing:8px;font-size:18px;margin-bottom:8px;" oninput="this.value=this.value.replace(/[^0-9]/g,'')">
+      <div id="exe-2fa-error" style="font-family:var(--font-mono);font-size:10px;color:#ff6b6b;min-height:14px;margin-bottom:10px;"></div>
+      <button class="btn btn-primary btn-block" id="exe-2fa-submit" onclick="exeSubmit2fa()">Verify →</button>
+    </div>
+
+    <!-- Skip-for-now — only visible in migrate mode -->
+    <div id="exe-skip-row" class="hidden" style="text-align:center;margin-top:24px;">
+      <a href="javascript:void(0)" onclick="exeSkipMigration()" style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:1px;">Skip for now — keep using this profile</a>
+    </div>
+
+    <!-- Sign-out-of-a-different-account — only visible in resume mode when a stale local flag exists -->
+    <div id="exe-forget-row" class="hidden" style="text-align:center;margin-top:24px;">
+      <a href="javascript:void(0)" onclick="exeForgetDevice()" style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:1px;">Not you? Sign out of this device</a>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── PIN MODAL ── -->
+<div class="modal-overlay" id="pin-modal">
+  <div class="modal-box" style="max-width:360px;text-align:center;">
+    <button class="modal-close" onclick="closePinModal()">✕</button>
+    <div id="pin-modal-avatar" style="width:64px;height:64px;border-radius:50%;border:2px solid var(--border);background:var(--surface3);margin:0 auto 12px;overflow:hidden;display:flex;align-items:center;justify-content:center;font-family:var(--font-display);font-weight:800;font-size:24px;color:rgba(255,255,255,0.5);"></div>
+    <div id="pin-modal-name" style="font-family:var(--font-display);font-size:20px;font-weight:800;letter-spacing:2px;color:#fff;margin-bottom:4px;"></div>
+    <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-bottom:4px;">ENTER YOUR PIN</div>
+    <div id="pin-error" style="font-family:var(--font-mono);font-size:10px;color:#ff6b6b;min-height:16px;margin-bottom:4px;"></div>
+    <div class="pin-display" id="pin-display">
+      <!-- dots generated dynamically based on PIN length -->
+    </div>
+    <div class="pin-keypad">
+      <div class="pin-key" onclick="pinKey('1')">1</div>
+      <div class="pin-key" onclick="pinKey('2')">2</div>
+      <div class="pin-key" onclick="pinKey('3')">3</div>
+      <div class="pin-key" onclick="pinKey('4')">4</div>
+      <div class="pin-key" onclick="pinKey('5')">5</div>
+      <div class="pin-key" onclick="pinKey('6')">6</div>
+      <div class="pin-key" onclick="pinKey('7')">7</div>
+      <div class="pin-key" onclick="pinKey('8')">8</div>
+      <div class="pin-key" onclick="pinKey('9')">9</div>
+      <div class="pin-key" onclick="pinKey('0')" style="grid-column:2;">0</div>
+      <div class="pin-key del" onclick="pinBackspace()">⌫</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── CREATE PROFILE MODAL ── -->
+<div class="modal-overlay" id="create-profile-modal">
+  <div class="modal-box" style="max-width:440px;">
+    <button class="modal-close" onclick="closeCreateProfile()">✕</button>
+    <div style="font-family:var(--font-display);font-size:22px;font-weight:800;letter-spacing:3px;margin-bottom:6px;">NEW PROFILE</div>
+    <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:2px;margin-bottom:24px;">SET UP YOUR SENTINEL PROFILE</div>
+
+    <div style="margin-bottom:14px;">
+      <label class="field-label">Profile Name</label>
+      <input type="text" id="new-profile-name" placeholder="e.g. ModerationBot">
+    </div>
+    <div style="margin-bottom:14px;">
+      <label class="field-label">PIN (4+ digits)</label>
+      <input type="password" id="new-profile-pin" placeholder="••••" maxlength="8" oninput="this.value=this.value.replace(/[^0-9]/g,'')">
+    </div>
+    <div style="margin-bottom:20px;">
+      <label class="field-label">Profile Picture (optional)</label>
+      <div style="display:flex;align-items:center;gap:14px;">
+        <div id="avatar-preview" style="width:56px;height:56px;border-radius:50%;border:1px solid var(--border);background:var(--surface3);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);flex-shrink:0;overflow:hidden;">None</div>
+        <div style="flex:1;">
+          <input type="file" id="new-profile-avatar-file" accept="image/*" style="display:none;" onchange="previewAvatar(this)">
+          <button class="btn btn-sm btn-block" onclick="document.getElementById('new-profile-avatar-file').click()">Upload Image</button>
+          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-top:6px;">JPG, PNG, GIF — max 1MB</div>
+        </div>
+      </div>
+      <input type="hidden" id="new-profile-avatar">
+    </div>
+
+    <div style="margin-bottom:14px;">
+      <label class="field-label">Invite Code <span style="color:var(--text-dimmer);font-size:9px;">(required)</span></label>
+      <input type="text" id="new-profile-invite" placeholder="e.g. AB12CD34" maxlength="8" style="text-transform:uppercase;" oninput="this.value=this.value.toUpperCase()">
+    </div>
+    <button class="btn btn-primary btn-block" onclick="createProfile()">Create Profile →</button>
+  </div>
+</div>
+
+<!-- ── REQUEST ACCESS MODAL ── -->
+<div class="modal-overlay" id="request-access-modal">
+  <div class="modal-box" style="max-width:440px;">
+    <button class="modal-close" onclick="closeRequestAccess()">✕</button>
+    <div style="font-family:var(--font-display);font-size:22px;font-weight:800;letter-spacing:3px;margin-bottom:6px;">REQUEST ACCESS</div>
+    <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:2px;margin-bottom:24px;">AN ADMIN WILL REVIEW YOUR REQUEST</div>
+    <div id="request-access-success" style="display:none;text-align:center;padding:20px 0;">
+      <div style="font-size:32px;margin-bottom:12px;">✓</div>
+      <div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:8px;">REQUEST SENT</div>
+      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">Check your email — you'll get your invite code once approved.</div>
+    </div>
+    <div id="request-access-form">
+      <div style="margin-bottom:14px;"><label class="field-label">Your Name</label><input type="text" id="req-name" placeholder="e.g. Moderator123"></div>
+      <div style="margin-bottom:14px;"><label class="field-label">Your Email <span style="color:var(--text-dimmer);font-size:9px;">(invite sent here)</span></label><input type="email" id="req-email" placeholder="you@example.com"></div>
+      <div style="margin-bottom:20px;"><label class="field-label">Why do you need access?</label><textarea id="req-reason" placeholder="Briefly explain your use case..." style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px;color:var(--text);font-family:var(--font-mono);font-size:12px;resize:vertical;min-height:80px;box-sizing:border-box;"></textarea></div>
+      <button class="btn btn-primary btn-block" onclick="submitAccessRequest()">Submit Request →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── SETTINGS MODAL ── -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal-box modal-box-lg">
+    <button class="modal-close" onclick="closeSettings()">✕</button>
+    <div class="section-title" style="margin-bottom:18px;">Settings</div>
+
+    <!-- Tab nav -->
+    <div class="settings-tabs">
+      <div class="settings-tab-btn active" id="stab-btn-profile" onclick="showSettingsTab('profile')">Profile</div>
+      <div class="settings-tab-btn" id="stab-btn-account" onclick="showSettingsTab('account')">EXE Account</div>
+      <div class="settings-tab-btn" id="stab-btn-extension" onclick="showSettingsTab('extension')">Extension</div>
+      <div class="settings-tab-btn" id="stab-btn-debug" onclick="showSettingsTab('debug')">Debug</div>
+    </div>
+
+    <div class="settings-tab-body">
+
+    <!-- ══ TAB: PROFILE ══ -->
+    <div class="settings-tab-panel active" id="stab-profile">
+      <div style="margin-bottom:24px;">
+        <div class="section-title">Profile</div>
+        <div id="settings-profile-info" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:14px;"></div>
+
+        <!-- Avatar change -->
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+          <div id="settings-avatar-preview" style="width:56px;height:56px;border-radius:50%;border:1px solid var(--border);background:var(--surface3);display:flex;align-items:center;justify-content:center;font-family:var(--font-display);font-weight:800;font-size:20px;color:rgba(255,255,255,0.5);flex-shrink:0;overflow:hidden;"></div>
+          <div style="flex:1;">
+            <input type="file" id="settings-avatar-file" accept="image/*" style="display:none;" onchange="previewSettingsAvatar(this)">
+            <button class="btn btn-sm" onclick="document.getElementById('settings-avatar-file').click()">Change Avatar</button>
+            <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-top:4px;">JPG, PNG, GIF — max 1MB</div>
+            <input type="hidden" id="settings-avatar-data">
+            <button class="btn btn-sm btn-primary" id="settings-avatar-save-btn" style="margin-top:6px;display:none;" onclick="saveSettingsAvatar()">Save Avatar</button>
+          </div>
+        </div>
+
+        <!-- PIN-based actions — hidden once this profile is migrated to an EXE Account -->
+        <div class="btn-group" id="settings-pin-actions">
+          <button class="btn btn-sm" onclick="openChangePinModal()">Change PIN</button>
+          <button class="btn btn-sm" onclick="openChangeNameModal()">Change Name</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteProfilePrompt()">Delete Profile</button>
+        </div>
+        <div class="btn-group" style="margin-top:8px;">
+          <button class="btn btn-sm btn-warn" onclick="signOutProfile()">Sign Out</button>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="danger-zone">
+        <div class="section-title" style="color:var(--accent3);">Danger Zone</div>
+        <div class="btn-group">
+          <button class="btn btn-danger btn-sm" onclick="clearAllHistory()">Clear History</button>
+          <button class="btn btn-danger btn-sm" onclick="clearCredentials()">Unlink All Accounts</button>
+        </div>
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:8px;line-height:1.7;">
+          <b style="color:rgba(255,255,255,0.5);">Unlink All Accounts</b> — removes all saved cookies and clears the active session everywhere.
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ TAB: EXE ACCOUNT ══ -->
+    <div class="settings-tab-panel" id="stab-account">
+      <!-- Shown once this profile is migrated -->
+      <div id="settings-exe-linked" class="hidden">
+        <div class="section-title">EXE Account</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-bottom:16px;">
+          <div>
+            <div style="font-size:13px;font-weight:600;">Linked to EXE Account</div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:2px;" id="settings-exe-email">—</div>
+          </div>
+          <div style="width:8px;height:8px;border-radius:50%;background:#4ade80;flex-shrink:0;"></div>
+        </div>
+        <div class="info-box" style="margin-bottom:16px;">
+          Two-step verification is on for this account and can't be turned off here — manage your password, email, and 2SV from the EXE homepage.
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-sm btn-warn" onclick="signOutProfile()">Sign Out</button>
+        </div>
+      </div>
+
+      <!-- Shown for profiles that haven't migrated yet -->
+      <div id="settings-exe-unlinked" class="hidden">
+        <div class="section-title">EXE Account</div>
+        <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);line-height:1.8;margin-bottom:18px;">
+          This profile is still using Sentinel's old PIN system. Sentinel is moving to EXE Accounts — migrating moves your history, groups, config, and saved Roblox accounts over, then permanently retires this PIN profile.
+        </div>
+        <button class="btn btn-primary btn-block" onclick="settingsStartMigration()">Migrate to EXE Account →</button>
+      </div>
+    </div>
+
+    <!-- ══ TAB: EXTENSION ══ -->
+    <div class="settings-tab-panel" id="stab-extension">
+      <div class="section-title" style="margin-bottom:12px;">Extension Connection</div>
+
+      <!-- Status row -->
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-bottom:12px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="width:8px;height:8px;border-radius:50%;flex-shrink:0;" id="settings-ext-dot"></div>
+          <div>
+            <div style="font-size:13px;font-weight:600;" id="settings-ext-label">Checking…</div>
+            <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);" id="settings-ext-sub">—</div>
+          </div>
+        </div>
+        <!-- Unlink button — only shown when extension IS connected -->
+        <button class="btn btn-sm" id="settings-unlink-ext-btn"
+          style="display:none;border-color:rgba(240,192,64,0.35);color:var(--warn);font-size:10px;"
+          onclick="unlinkExtension()">Unlink</button>
+      </div>
+
+      <!-- Link Extension dropdown — shown when extension is NOT connected but account IS -->
+      <div id="settings-link-ext-section" style="display:none;">
+        <button class="btn btn-block btn-primary" onclick="toggleSettingsCodeDropdown()" style="margin-bottom:0;display:flex;align-items:center;justify-content:space-between;opacity:0.38;pointer-events:none;cursor:not-allowed;" title="Extension features are under maintenance">
+          <span>Extension — Under Maintenance</span>
+          <span id="settings-code-chevron" style="font-size:10px;transition:transform .2s;">▼</span>
+        </button>
+        <div id="settings-code-dropdown" style="display:none;margin-top:8px;padding:14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;">
+          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-align:center;margin-bottom:10px;">ENTER THIS CODE IN YOUR SENTINEL EXTENSION</div>
+          <div class="connect-code-display" id="settings-connect-code-display" style="font-size:36px;letter-spacing:12px;text-align:center;padding:14px 0;font-family:var(--font-display);font-weight:800;color:#fff;">----</div>
+          <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);text-align:center;margin-bottom:12px;" id="settings-code-expiry">—</div>
+          <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);line-height:1.7;text-align:center;">
+            Open the Sentinel extension → enter this code → your session will resume instantly.
+          </div>
+        </div>
+      </div>
+
+      <!-- Connect section — shown when no account at all -->
+      <div id="settings-no-account-section" style="display:none;">
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);padding:10px 0;line-height:1.7;">
+          No Roblox account connected. Go to the <b style="color:rgba(255,255,255,0.5);">Dashboard</b> tab to add one via the extension.
+        </div>
+      </div>
+
+      <div style="margin-top:16px;">
+        <div class="toggle-label" style="font-size:13px;margin-bottom:4px;">Account Save Mode</div>
+        <div class="toggle-desc" style="margin-bottom:10px;">Controls whether Roblox session tokens are saved to Postgres when you connect via extension</div>
+        <div class="save-mode-options" id="save-mode-options">
+          <div class="save-mode-option active" id="smode-ask" onclick="setCookieSaveMode('ask')">
+            <div class="save-mode-dot"></div>
+            <div>
+              <div class="save-mode-label">Ask each time</div>
+              <div class="save-mode-desc">A popup appears when a new account connects — you choose whether to save it</div>
+            </div>
+          </div>
+          <div class="save-mode-option" id="smode-always" onclick="setCookieSaveMode('always')">
+            <div class="save-mode-dot"></div>
+            <div>
+              <div class="save-mode-label">Always save</div>
+              <div class="save-mode-desc">Silently saves every account to the database on connect — no popup shown</div>
+            </div>
+          </div>
+          <div class="save-mode-option" id="smode-never" onclick="setCookieSaveMode('never')">
+            <div class="save-mode-dot"></div>
+            <div>
+              <div class="save-mode-label">Never save</div>
+              <div class="save-mode-desc">Accounts are never stored in Postgres — existing saved accounts will be removed</div>
+            </div>
+          </div>
+        </div>
+        <div class="info-box warn-box" style="margin-top:10px;margin-bottom:0;">
+          Saved tokens grant full Roblox account access. Only enable if you trust this server.
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ TAB: DEBUG ══ -->
+    <div class="settings-tab-panel" id="stab-debug">
+      <div class="debug-section">
+        <div class="section-title">Debug & Monitoring</div>
+
+        <div class="toggle-row" style="margin-bottom:12px;">
+          <div>
+            <div class="toggle-label" style="font-size:13px;">Debug Mode</div>
+            <div class="toggle-desc">Shows memory bar, live logs, and all system events</div>
+          </div>
+          <div class="toggle-sw" id="debug-mode-toggle" onclick="toggleDebugMode(this)"></div>
+        </div>
+
+        <div id="debug-panel-content" style="display:none;">
+
+          <!-- Memory stats -->
+          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">Memory</div>
+          <div class="debug-grid">
+            <div class="debug-stat"><div class="debug-stat-val" id="dbg-rss">—</div><div class="debug-stat-lbl">Heap RSS (MB)</div></div>
+            <div class="debug-stat"><div class="debug-stat-val" id="dbg-pct">—</div><div class="debug-stat-lbl">Limit Usage %</div></div>
+            <div class="debug-stat"><div class="debug-stat-val" id="dbg-cpu">—</div><div class="debug-stat-lbl">CPU %</div></div>
+            <div class="debug-stat"><div class="debug-stat-val" id="dbg-sessions">—</div><div class="debug-stat-lbl">Active Sessions</div></div>
+          </div>
+          <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-bottom:12px;" id="dbg-mem-detail">—</div>
+          <div class="btn-group" style="margin-bottom:18px;">
+            <button class="btn btn-sm" onclick="forceGC()">Force GC</button>
+            <button class="btn btn-sm" onclick="refreshDebugStats()">Refresh Stats</button>
+            <button class="btn btn-sm btn-warn" id="dbg-degraded-badge" style="display:none;">DEGRADED MODE ACTIVE</button>
+          </div>
+
+          <!-- Session inspector -->
+          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Active Sessions</div>
+          <div id="dbg-sessions-list" style="margin-bottom:18px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:var(--font-mono);font-size:10px;color:var(--text-dim);">—</div>
+
+          <!-- Log viewer -->
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+            <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;">Live Logs</div>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <select id="settings-log-level" onchange="renderSettingsLogs()" style="width:auto;padding:3px 8px;font-size:10px;">
+                <option value="">ALL</option>
+                <option value="INFO">INFO</option>
+                <option value="DEBUG">DEBUG</option>
+                <option value="WARN">WARN</option>
+                <option value="ERROR">ERROR</option>
+                <option value="ARCHIVE">ARCHIVE</option>
+                <option value="DM">DM</option>
+                <option value="NETWORK">NETWORK</option>
+                <option value="MEMORY">MEMORY</option>
+              </select>
+              <select id="settings-log-source" onchange="renderSettingsLogs()" style="width:auto;padding:3px 8px;font-size:10px;">
+                <option value="">ALL SOURCES</option>
+                <option value="MONITOR">MONITOR</option>
+                <option value="SYSTEM">SYSTEM</option>
+                <option value="WATCHDOG">WATCHDOG</option>
+                <option value="DEBUG">DEBUG</option>
+              </select>
+              <button class="btn btn-sm" style="padding:3px 10px;font-size:10px;" onclick="renderSettingsLogs()">Refresh</button>
+              <button class="btn btn-sm btn-danger" style="padding:3px 10px;font-size:10px;" onclick="clearServerLogs()">Clear</button>
+            </div>
+          </div>
+          <div class="debug-log-box" id="settings-log-box">
+            <div style="color:var(--text-dimmer);text-align:center;padding:20px 0;font-family:var(--font-mono);font-size:10px;">No logs yet</div>
+          </div>
+          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-top:6px;" id="settings-log-count">0 entries</div>
+
+        </div>
+      </div>
+    </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── CHANGE PIN MODAL ── -->
+<div class="modal-overlay" id="change-pin-modal">
+  <div class="modal-box" style="max-width:400px;">
+    <button class="modal-close" onclick="document.getElementById('change-pin-modal').classList.remove('open')">✕</button>
+    <div style="font-family:var(--font-display);font-size:20px;font-weight:800;letter-spacing:3px;margin-bottom:20px;">CHANGE PIN</div>
+    <div style="margin-bottom:12px;"><label class="field-label">Current PIN</label><input type="password" id="cp-current" placeholder="••••" maxlength="8" oninput="this.value=this.value.replace(/[^0-9]/g,'')"></div>
+    <div style="margin-bottom:20px;"><label class="field-label">New PIN</label><input type="password" id="cp-new" placeholder="••••" maxlength="8" oninput="this.value=this.value.replace(/[^0-9]/g,'')"></div>
+    <button class="btn btn-primary btn-block" onclick="changePin()">Update PIN</button>
+  </div>
+</div>
+
+<!-- ── CHANGE NAME MODAL ── -->
+<div class="modal-overlay" id="change-name-modal">
+  <div class="modal-box" style="max-width:400px;">
+    <button class="modal-close" onclick="document.getElementById('change-name-modal').classList.remove('open')">✕</button>
+    <div style="font-family:var(--font-display);font-size:20px;font-weight:800;letter-spacing:3px;margin-bottom:20px;">CHANGE NAME</div>
+    <div style="margin-bottom:12px;"><label class="field-label">Current PIN (to verify)</label><input type="password" id="cn-pin" placeholder="••••" maxlength="8" oninput="this.value=this.value.replace(/[^0-9]/g,'')"></div>
+    <div style="margin-bottom:20px;"><label class="field-label">New Name</label><input type="text" id="cn-name" placeholder="New profile name"></div>
+    <button class="btn btn-primary btn-block" onclick="changeName()">Update Name</button>
+  </div>
+</div>
+
+<!-- ── FLOATING LOG BUTTON ── -->
+<div id="log-float-btn" onclick="toggleFloatLog()" title="Toggle log panel">LOG</div>
+
+<!-- ── FLOATING LOG PANEL ── -->
+<div id="log-float-panel">
+  <div class="log-panel-header">
+    <div class="log-panel-title">LIVE LOGS</div>
+    <div class="log-panel-controls">
+      <select id="float-log-level" onchange="renderFloatLogs()">
+        <option value="">ALL LEVELS</option>
+        <option value="INFO">INFO</option>
+        <option value="DEBUG">DEBUG</option>
+        <option value="WARN">WARN</option>
+        <option value="ERROR">ERROR</option>
+        <option value="ARCHIVE">ARCHIVE</option>
+        <option value="DM">DM</option>
+        <option value="NETWORK">NETWORK</option>
+        <option value="MEMORY">MEMORY</option>
+      </select>
+      <select id="float-log-source" onchange="renderFloatLogs()">
+        <option value="">ALL SOURCES</option>
+        <option value="MONITOR">MONITOR</option>
+        <option value="SYSTEM">SYSTEM</option>
+        <option value="WATCHDOG">WATCHDOG</option>
+        <option value="DEBUG">DEBUG</option>
+        <option value="NETWORK">NETWORK</option>
+      </select>
+      <button class="btn btn-sm btn-danger" style="padding:3px 8px;font-size:9px;" onclick="clearFloatLogs()">CLR</button>
+    </div>
+  </div>
+  <div class="log-entries" id="float-log-entries">
+    <div style="color:var(--text-dimmer);text-align:center;padding:20px 0;">Enable debug mode to see logs</div>
+  </div>
+</div>
+
+<!-- ── MAIN APP ── -->
+<div id="app">
+  <div class="corner-decor tl"></div><div class="corner-decor tr"></div>
+  <div class="corner-decor bl"></div><div class="corner-decor br"></div>
+
+  <div id="topbar">
+    <div class="logo-lockup">
+      <img src="/sentinel/static/sentinelLogo.png" style="width:36px;height:36px;object-fit:contain;flex-shrink:0;" alt="Sentinel">
+      <div>
+        <div class="logo-text">SENTINEL</div>
+        <div class="logo-sub">ROBLOX ASSET MODERATION</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <div class="mem-bar-wrap" id="mem-bar-wrap" style="display:none;">
+        <div class="mem-track"><div class="mem-fill" id="mem-fill" style="width:0%"></div></div>
+        <span id="mem-pct-text">0%</span>
+        <span id="mem-mb-text" style="color:var(--text-dimmer);">0MB</span>
+        <span class="degraded-tag" id="degraded-tag" style="display:none;">DEGRADED</span>
+      </div>
+      <div class="status-pill" id="main-status-pill">
+        <div class="status-dot" id="main-status-dot"></div>
+        <span id="main-status-text">INACTIVE</span>
+      </div>
+      <div id="sanity-indicator" title="Sanity check: validates all account cookies every 5 minutes">
+        <div class="sanity-dot"></div>
+        <span id="sanity-indicator-text">CHECKING</span>
+      </div>
+      <div class="status-pill" id="ext-status-pill" title="Extension connection status" style="cursor:default;">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" id="ext-status-icon" style="color:var(--text-dimmer);flex-shrink:0;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        <span id="ext-status-text" style="font-size:10px;">EXT OFFLINE</span>
+      </div>
+      <div class="profile-pill" onclick="openSettings()">
+        <div class="profile-pill-avatar" id="topbar-avatar"></div>
+        <span class="profile-pill-name" id="topbar-profile-name">—</span>
+      </div>
+      <button class="btn btn-sm" onclick="openSettings()">⚙ Settings</button>
+    </div>
+  </div>
+
+  <div id="nav">
+    <div id="nav-indicator"></div>
+    <button class="nav-tab active" onclick="showTab('dashboard')">Dashboard</button>
+    <button class="nav-tab" onclick="showTab('groups')">Groups</button>
+    <button class="nav-tab" onclick="showTab('config')">Config</button>
+    <button class="nav-tab" onclick="showTab('history')">History<span class="tab-badge" id="history-badge"></span></button>
+
+    <button class="nav-tab" id="admin-tab-btn" style="display:none;" onclick="showTab('admin')">Admin</button>
+  </div>
+
+  <div id="content">
+
+    <!-- ── DASHBOARD ── -->
+    <div class="tab-panel active" id="tab-dashboard">
+      <!-- Monitor health banner — shown when the task dies unexpectedly -->
+      <div id="monitor-health-banner">
+        <span class="mhb-icon">⚠</span>
+        <span class="mhb-msg">Active monitoring stopped unexpectedly. Click restart to resume.</span>
+        <button class="mhb-restart" onclick="restartMonitor()">↺ Restart Monitor</button>
+      </div>
+      <div style="max-width:1200px;margin:0 auto;">
+
+        <!-- Headless mode banner — shown when account connected but extension offline -->
+        <div id="headless-banner" style="display:none;margin-bottom:16px;padding:12px 16px;background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.25);border-radius:8px;display:none;align-items:center;justify-content:space-between;gap:12px;">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="width:8px;height:8px;border-radius:50%;background:rgba(240,192,64,0.8);flex-shrink:0;animation:pulse-dot 1.5s infinite;"></div>
+            <div>
+              <div style="font-weight:600;font-size:13px;color:var(--warn);">HEADLESS MODE</div>
+              <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:1px;">Account connected · Extension offline · Monitoring may be limited</div>
+            </div>
+          </div>
+          <button class="btn btn-sm" onclick="openSettings()" style="border-color:rgba(240,192,64,0.35);color:var(--warn);white-space:nowrap;flex-shrink:0;">Link Extension →</button>
+        </div>
+
+        <div class="grid-4 mb-20">
+          <div class="stat-card"><div class="stat-value" id="stat-archived">0</div><div class="stat-label">Assets Archived</div></div>
+          <div class="stat-card"><div class="stat-value" id="stat-groups">0</div><div class="stat-label">Groups Monitored</div></div>
+          <div class="stat-card"><div class="stat-value" id="stat-whitelisted">0</div><div class="stat-label">Whitelisted</div></div>
+          <div class="stat-card" id="headless-stat-card"><div class="stat-value" id="stat-headless" style="font-size:18px;">—</div><div class="stat-label">Mode</div></div>
+        </div>
+
+        <div class="grid-2 mb-20">
+          <div class="card">
+            <div class="section-title">Monitoring Control</div>
+            <div class="toggle-row">
+              <div><div class="toggle-label">Active Monitoring</div><div class="toggle-desc">Polls groups for new uploads</div></div>
+              <div class="toggle-sw" id="monitor-toggle" onclick="toggleMonitor(this)"></div>
+            </div>
+            <!-- Phase 2 activity check indicator — shown during sanity check phase 2 -->
+            <div id="activity-check-row">
+              <div class="activity-check-dot"></div>
+              <span class="activity-check-label">PERFORMING ACTIVITY SANITY CHECK</span>
+              <span class="activity-check-countdown" id="activity-check-countdown">5</span>
+              <span style="font-family:var(--font-mono);font-size:9px;color:rgba(240,192,64,0.5);">SEC</span>
+            </div>
+            <div class="toggle-row">
+              <div><div class="toggle-label">Archive Existing Assets</div><div class="toggle-desc">Also archive assets already in group on start</div></div>
+              <div class="toggle-sw" id="archive-existing-toggle" onclick="toggleArchiveExisting(this)"></div>
+            </div>
+            <div class="toggle-row">
+              <div><div class="toggle-label">Auto-Start on Connect</div><div class="toggle-desc">Automatically start monitoring when extension connects</div></div>
+              <div class="toggle-sw" id="auto-start-toggle" onclick="toggleAutoStart(this)"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="section-title">Roblox Account</div>
+
+            <!-- Active account display -->
+            <div id="conn-account-display" style="font-size:13px;color:var(--text-dim);margin-bottom:14px;">No account active</div>
+
+            <!-- Saved accounts list -->
+            <div id="saved-accounts-section" style="display:none;margin-bottom:14px;">
+              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Saved Accounts</div>
+              <div id="saved-accounts-list"></div>
+            </div>
+
+            <!-- Initial connect options (shown when NO account active) -->
+            <div id="add-account-section">
+              <div id="connect-code-box" style="display:none;margin-bottom:14px;">
+                <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-align:center;margin-bottom:10px;">ENTER THIS CODE IN YOUR SENTINEL EXTENSION</div>
+                <div class="connect-code-display" id="connect-code-display">----</div>
+                <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);text-align:center;" id="code-expiry-text">—</div>
+              </div>
+              <button class="btn btn-primary btn-block" onclick="showConnectCode()" style="margin-bottom:8px;opacity:0.38;pointer-events:none;cursor:not-allowed;" title="Extension features are under maintenance">Extension — Under Maintenance</button>
+              <a href="/sentinel/static/sentinel-extension.zip" download style="text-decoration:none;display:block;margin-bottom:8px;">
+                <button class="btn btn-block" style="width:100%;">⬇ Download Extension</button>
+              </a>
+              <button class="btn btn-block" onclick="showManualCookieInput()" style="border-color:rgba(240,192,64,0.3);color:var(--text-dim);font-size:12px;">⚠ Add Account Manually (No Extension)</button>
+            </div>
+
+            <!-- Manual cookie input (discouraged fallback) -->
+            <div id="manual-cookie-section" style="display:none;margin-top:10px;">
+              <div class="info-box" style="background:rgba(240,192,64,0.06);border-color:rgba(240,192,64,0.25);margin-bottom:10px;">
+                <div style="color:var(--warn);font-family:var(--font-mono);font-size:10px;font-weight:700;margin-bottom:6px;">⚠ Security Warning</div>
+                <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);line-height:1.7;">
+                  Your cookie grants <b>full access</b> to this Roblox account.<br>
+                  It will be <b>saved to Postgres</b> regardless of your Save Mode setting.<br>
+                  You can remove it later from the account list above.<br>
+                  <b>Only use a dedicated bot/mod account — never your main.</b>
+                </div>
+              </div>
+              <label class="field-label">Roblox Cookie (.ROBLOSECURITY)</label>
+              <textarea id="manual-cookie-input" placeholder="Paste your .ROBLOSECURITY cookie here..." style="min-height:70px;font-family:var(--font-mono);font-size:10px;word-break:break-all;"></textarea>
+              <div style="display:flex;gap:8px;margin-top:8px;">
+                <button class="btn btn-primary" style="flex:1;" onclick="submitManualCookie()">Add Account</button>
+                <button class="btn" onclick="hideManualCookieInput()">Cancel</button>
+              </div>
+            </div>
+
+            <!-- Connected actions (shown when account IS active) -->
+            <div id="connected-account-section" style="display:none;margin-top:10px;">
+              <button class="btn btn-block" onclick="testConnection()" style="margin-bottom:6px;">Test Active Connection</button>
+              <button class="btn btn-block btn-primary" onclick="openAddAnotherModal()" style="margin-bottom:6px;">+ Add Another Account</button>
+              <button class="btn btn-block" onclick="disconnectExtension()" style="border-color:rgba(255,59,59,0.25);color:rgba(255,100,100,0.7);font-size:11px;" id="disconnect-ext-btn">Disconnect Extension</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mb-20">
+          <div class="section-title">Recent Activity</div>
+          <div id="recent-activity"><div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);padding:20px 0;text-align:center;">No activity yet — start monitoring to see events here.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── GROUPS ── -->
+    <div class="tab-panel" id="tab-groups">
+      <div style="max-width:1000px;margin:0 auto;">
+        <div class="card mb-28">
+          <div class="section-title">Add Group</div>
+          <div class="grid-2" style="gap:12px;margin-bottom:0;">
+            <div>
+              <label class="field-label">Group URL or ID</label>
+              <input type="text" id="group-url-input" placeholder="https://www.roblox.com/groups/12345/ or ID">
+            </div>
+            <div style="display:flex;align-items:flex-end;">
+              <button class="btn btn-primary btn-block" onclick="addGroup()">Add Group</button>
+            </div>
+          </div>
+        </div>
+        <div class="section-title">Active Groups</div>
+        <div id="groups-list"><div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);padding:20px 0;text-align:center;">No groups added yet.</div></div>
+      </div>
+    </div>
+
+    <!-- ── CONFIG ── -->
+    <div class="tab-panel" id="tab-config">
+      <div style="max-width:1000px;margin:0 auto;">
+
+        <div class="section-title">Asset Type Filters</div>
+        <div class="card mb-28">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);">Select which asset types to monitor and archive</div>
+            <button class="btn btn-sm" onclick="selectAllAssetTypes()">Select All</button>
+          </div>
+          <div class="asset-filter-grid" id="asset-filter-grid"></div>
+        </div>
+
+        <div class="section-title">Archive Settings</div>
+        <div class="grid-2 mb-28">
+          <div class="card">
+            <label class="field-label">Polling Interval</label>
+            <div class="slider-row">
+              <input type="range" id="polling-slider" min="5" max="300" value="60" oninput="updateSlider('polling-val',this.value,'s');checkFastPollWarning(this.value)">
+              <div class="slider-val" id="polling-val">60s</div>
+            </div>
+            <div id="fast-poll-warning" style="display:none;" class="info-box warn-box" style="margin-top:10px;">
+              ⚠ Polling below 30s may cause Roblox rate limiting. Not guaranteed but possible.
+            </div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:8px;">How often to check for new uploads</div>
+            <div class="toggle-row" style="margin-top:12px;">
+              <div><div class="toggle-label" style="font-size:13px;">Allow Fast Polling (&lt;30s)</div><div class="toggle-desc">Unlock intervals below 30 seconds</div></div>
+              <div class="toggle-sw" id="fast-poll-toggle" onclick="toggleFastPoll(this)"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <label class="field-label">Delay Before Archive (seconds)</label>
+            <div class="slider-row">
+              <input type="range" id="delay-slider" min="0" max="120" value="0" oninput="updateSlider('delay-val',this.value,'s')">
+              <div class="slider-val" id="delay-val">0s</div>
+            </div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:8px;">0 = archive immediately on detection</div>
+          </div>
+        </div>
+
+
+
+        <div class="section-title">Whitelist</div>
+        <div class="card mb-28">
+          <div class="info-box" style="margin-bottom:14px;">Each asset type has its own whitelist. "All Types" applies globally across everything.</div>
+          <div class="wl-tabs" id="wl-tabs"></div>
+          <label class="field-label" id="wl-current-label">Whitelisted Users — All Types</label>
+          <textarea id="whitelist-input" placeholder="Enter Roblox user IDs or usernames, one per line" oninput="updateWhitelistCount()"></textarea>
+          <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:8px;" id="whitelist-count">0 users</div>
+        </div>
+
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="saveConfig()">Save Config</button>
+          <button class="btn" onclick="exportConfig()">Export Config</button>
+          <button class="btn btn-danger" onclick="clearConfig()">Reset Config</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── HISTORY ── -->
+    <div class="tab-panel" id="tab-history">
+      <div style="max-width:1100px;margin:0 auto;">
+        <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;align-items:center;">
+          <input type="text" id="history-search" placeholder="Search by username, asset name..." oninput="filterHistory()" style="flex:1;min-width:180px;">
+          <select id="history-filter-type" onchange="filterHistory()" style="width:auto;">
+            <option value="">All Types</option>
+            <option>Audio</option><option>Decal</option>
+            <option>Video</option><option>Mesh</option><option>Plugin</option>
+            <option>Animation</option><option>Model</option><option>Package</option>
+          </select>
+          <label style="display:flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);cursor:pointer;user-select:none;">
+            <input type="checkbox" id="history-select-mode" onchange="toggleSelectMode(this.checked)" style="width:auto;">
+            Select
+          </label>
+          <button class="btn btn-sm" onclick="clearHistory()">Clear History</button>
+        </div>
+        <!-- Bulk restore toolbar — shown in select mode -->
+        <div id="restore-toolbar">
+          <span class="restore-count-label" id="restore-count-label">0 selected</span>
+          <span id="restore-progress"></span>
+          <button class="btn btn-sm" onclick="selectAllHistory()" style="font-size:10px;">All</button>
+          <button class="btn btn-sm" onclick="deselectAllHistory()" style="font-size:10px;">None</button>
+          <button class="btn btn-primary btn-sm" id="bulk-restore-btn" onclick="bulkRestore()" disabled>↩ Restore Selected</button>
+        </div>
+        <div id="history-list"><div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);padding:20px 0;text-align:center;">No moderation history yet.</div></div>
+      </div>
+    </div>
+
+
+
+    <!-- ── ADMIN ── -->
+    <div class="tab-panel" id="tab-admin">
+      <div style="max-width:900px;margin:0 auto;">
+
+        <div class="section-title" style="margin-bottom:16px;">Generate Invite Code</div>
+        <div class="card mb-28" style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+          <div style="flex:1;min-width:200px;">
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:4px;">Generate a one-time invite code to send to someone manually.</div>
+          </div>
+          <button class="btn btn-primary" onclick="adminGenerateInvite()">Generate Code</button>
+          <div id="generated-code-box" style="display:none;background:var(--surface2);border:1px solid var(--accent);border-radius:8px;padding:12px 20px;font-family:var(--font-mono);font-size:22px;letter-spacing:4px;color:var(--accent);cursor:pointer;" title="Click to copy" onclick="copyGeneratedCode()"></div>
+        </div>
+
+        <div class="section-title" style="margin-bottom:16px;">Access Requests</div>
+        <div class="card mb-28" id="admin-requests-card">
+          <div id="admin-requests-loading" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);">Loading...</div>
+          <div id="admin-requests-list" style="display:flex;flex-direction:column;gap:12px;"></div>
+          <div id="admin-requests-empty" style="display:none;font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);">No requests yet.</div>
+        </div>
+
+        <div class="section-title" style="margin-bottom:16px;">Manage Profiles</div>
+        <div class="card" id="admin-profiles-card">
+          <div id="admin-profiles-loading" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);">Loading...</div>
+          <div id="admin-profiles-list" style="display:flex;flex-direction:column;gap:10px;"></div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+// ── STATE ─────────────────────────────────────────────────────────────────────
+const ALL_ASSET_TYPES = ['Audio','Decal','Video','Mesh','Plugin','Animation','Model','Package']; // Image excluded — cannot be archived (system-generated from Decals)
+const WL_KEYS = ['all', ...ALL_ASSET_TYPES];
+
+let STATE = {
+  profileId:      null,
+  profileName:    null,
+  profileAvatar:  null,
+  monitoring:     false,
+  hasCredential:  false,
+  extensionLinked: false,
+  activeWlTab:    'all',
+  isAdmin:        false,
+  _lastPin:       null,
+  // EXE Account
+  migrated:       false,   // true once this profile is owned by an EXE Account
+  exeEmail:       null,
+  exeAccessToken: null,
+};
+
+// ── EXE ACCOUNT SYSTEM ──────────────────────────────────────────────────────
+// Point this at your deployed exe-accounts-api service, e.g.
+// 'https://exe-accounts-xyz.onrender.com'. Register/login/refresh/logout go
+// straight to this service from the browser — only migrate/resume touch
+// Sentinel's own backend (BASE_PATH), since those need Sentinel's database.
+const EXE_API_BASE = 'https://exe-accounts-api.onrender.com';
+
+const EXE_LS_REFRESH  = 'sentinel_exe_refresh_token';
+const EXE_LS_MIGRATED = 'sentinel_exe_migrated';
+
+async function exeApi(method, path, body, accessToken) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  if (accessToken) opts.headers['Authorization'] = 'Bearer ' + accessToken;
+  let r;
+  try { r = await fetch(EXE_API_BASE + path, opts); }
+  catch(e) { throw new Error('Could not reach the EXE Account server — check your connection'); }
+  let data;
+  try { data = await r.json(); }
+  catch(e) { throw new Error(`Unexpected response from EXE Account server (${r.status})`); }
+  if (!r.ok) {
+    const det = data.detail;
+    let msg;
+    if (typeof det === 'string') msg = det;
+    else if (Array.isArray(det)) msg = det.map(e => `${e.loc?.join('.')}: ${e.msg}`).join('; ');
+    else msg = data.error || `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data;
 }
 
-def get_config(profile_id: str) -> dict:
-    rows = db_exec("SELECT key, value FROM config WHERE profile_id=?", (profile_id,), fetch="all")
-    cfg = dict(DEFAULT_CFG)
-    for row in (rows or []):
-        try:
-            cfg[row["key"]] = json.loads(row["value"])
-        except Exception:
-            cfg[row["key"]] = row["value"]
-    return cfg
+// ── EXTENSION MAINTENANCE MODE ────────────────────────────────────────────────
+// Set to true to disable all extension connectivity in the UI.
+// All code is preserved — this only disables the UI surface.
+const EXT_MAINTENANCE = true;
+const EXT_MAINTENANCE_MSG = 'Extension connectivity is temporarily unavailable for maintenance. Your accounts and data are safe. Check back soon.';
 
-def set_cfg(profile_id: str, key: str, value):
-    db_upsert("config", ["profile_id", "key"],
-              {"profile_id": profile_id, "key": key, "value": json.dumps(value)})
-
-# ── ROBLOX API HELPERS ────────────────────────────────────────────────────────
-
-ASSET_TYPE_IDS = {
-    "Audio": 3, "Image": 1, "Decal": 13, "Video": 62,
-    "Mesh": 4, "Plugin": 38, "Animation": 24,
-    "Model": 10, "Package": 32,
+function extBlocked() {
+  toast('Extension features are under maintenance — ' + EXT_MAINTENANCE_MSG, 'warn');
 }
 
-async def rblx_get(url: str, *, cookie=None, params=None) -> httpx.Response:
-    cookies: dict = {}
-    if cookie:
-        cookies[".ROBLOSECURITY"] = cookie
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
-        return await c.get(url, cookies=cookies, params=params)
+function applyExtMaintenance() {
+  if (!EXT_MAINTENANCE) return;
 
-_csrf_cache: dict = {}
-# Tracks (group_id, asset_type) pairs that consistently 403 on the listing endpoint.
-# Suppressed after the first logged failure to avoid log spam on every poll.
-# Tracks asset types that returned a hard permanent error (403 permission denied)
-# for a specific group. Only truly permanent failures go here — NOT network errors,
-# NOT 429 rate limits, NOT temporary Roblox outages.
-# Format: { (group_id, asset_type): timestamp_of_first_failure }
-# Re-checked every 30 minutes in case permissions change.
-_unsupported_group_types: dict = {}
-_UNSUPPORTED_RECHECK_SECS = 1800  # 30 minutes
+  // All selectors that should be greyed out / disabled
+  const blockSelectors = [
+    '#connect-code-box',
+    '[onclick="showConnectCode()"]',
+    '[onclick="disconnectExtension()"]',
+    '[onclick="unlinkExtension()"]',
+    '[onclick="toggleSettingsCodeDropdown()"]',
+    '#settings-unlink-ext-btn',
+    '#settings-link-ext-section',
+    '#disconnect-ext-btn',
+    '#add-via-ext-card',
+    '#headless-banner button',
+  ];
 
-async def get_csrf(cookie: str) -> str:
-    now = time.time()
-    if cookie in _csrf_cache and now - _csrf_cache[cookie][1] < 110:
-        return _csrf_cache[cookie][0]
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.post("https://auth.roblox.com/v2/logout",
-                         cookies={".ROBLOSECURITY": cookie})
-        token = r.headers.get("x-csrf-token", "")
-        _csrf_cache[cookie] = (token, now)
-        sentinel_log(f"CSRF token refreshed", "DEBUG", "NETWORK")
-        return token
+  blockSelectors.forEach(sel => {
+    document.querySelectorAll(sel).forEach(el => {
+      el.style.opacity       = '0.38';
+      el.style.pointerEvents = 'none';
+      el.style.cursor        = 'not-allowed';
+      el.title               = 'Under maintenance';
+    });
+  });
 
-async def validate_cookie(cookie: str) -> dict:
-    r = await rblx_get("https://users.roblox.com/v1/users/authenticated", cookie=cookie)
-    if r.status_code != 200:
-        raise HTTPException(400, "Invalid or expired cookie")
-    d = r.json()
-    uid = str(d["id"])
-    avatar_url = None
-    try:
-        ar = await rblx_get(
-            "https://thumbnails.roblox.com/v1/users/avatar-headshot",
-            cookie=cookie,
-            params={"userIds": uid, "size": "150x150", "format": "Png", "isCircular": "false"},
-        )
-        if ar.status_code == 200:
-            data = ar.json().get("data", [])
-            if data:
-                avatar_url = data[0].get("imageUrl")
-    except Exception:
-        pass
-    return {
-        "userId":      uid,
-        "username":    d["name"],
-        "displayName": d["displayName"],
-        "avatarUrl":   avatar_url,
+  // Replace "Connect via Extension" button text and disable it
+  document.querySelectorAll('[onclick="showConnectCode()"]').forEach(btn => {
+    btn.textContent = 'Extension — Under Maintenance';
+    btn.style.opacity = '0.38';
+    btn.style.pointerEvents = 'none';
+  });
+
+  // Replace "Link Extension →" button in headless banner
+  document.querySelectorAll('#headless-banner button').forEach(btn => {
+    btn.textContent = 'Maintenance';
+    btn.style.opacity = '0.38';
+    btn.style.pointerEvents = 'none';
+  });
+
+  // Grey out the extension picker card and show maintenance badge
+  const extCard = document.getElementById('add-via-ext-card');
+  if (extCard) {
+    extCard.style.opacity       = '0.38';
+    extCard.style.pointerEvents = 'none';
+    extCard.style.cursor        = 'not-allowed';
+    extCard.title               = 'Under maintenance';
+    // Add maintenance badge next to title
+    const title = extCard.querySelector('[style*="font-weight:600"]');
+    if (title && !title.querySelector('.maint-badge')) {
+      const badge = document.createElement('span');
+      badge.className = 'maint-badge';
+      badge.style.cssText = 'font-family:var(--font-mono);font-size:9px;color:rgba(255,160,60,0.9);letter-spacing:1px;background:rgba(255,160,60,0.1);border:1px solid rgba(255,160,60,0.25);border-radius:4px;padding:1px 7px;margin-left:8px;';
+      badge.textContent = 'MAINTENANCE';
+      title.appendChild(badge);
+    }
+  }
+
+  // Add a maintenance notice to the ext-status-pill in topbar
+  const extTxt = document.getElementById('ext-status-text');
+  if (extTxt) extTxt.textContent = 'EXT MAINTENANCE';
+  const extIcon = document.getElementById('ext-status-icon');
+  if (extIcon) extIcon.style.color = 'rgba(255,160,60,0.7)';
+  const extPill = document.getElementById('ext-status-pill');
+  if (extPill) {
+    extPill.style.borderColor = 'rgba(255,160,60,0.25)';
+    extPill.style.background  = 'rgba(255,160,60,0.06)';
+    extPill.title             = 'Extension maintenance: ' + EXT_MAINTENANCE_MSG;
+  }
+
+  // Add a banner below the topbar if we're on the dashboard
+  const existing = document.getElementById('ext-maintenance-banner');
+  if (!existing) {
+    const banner = document.createElement('div');
+    banner.id = 'ext-maintenance-banner';
+    banner.style.cssText = 'background:rgba(255,160,60,0.07);border-bottom:1px solid rgba(255,160,60,0.2);padding:9px 24px;display:flex;align-items:center;gap:10px;font-family:var(--font-mono);font-size:10px;color:rgba(255,160,60,0.85);letter-spacing:0.5px;';
+    banner.innerHTML = '<span style="flex-shrink:0;"></span><span><b style="color:rgba(255,160,60,1);">EXTENSION MAINTENANCE</b> — ' + EXT_MAINTENANCE_MSG + '</span>';
+    // Insert after the topbar
+    const topbar = document.querySelector('.topbar') || document.querySelector('header') || document.querySelector('.navbar');
+    if (topbar && topbar.parentNode) {
+      topbar.parentNode.insertBefore(banner, topbar.nextSibling);
+    } else {
+      document.body.insertBefore(banner, document.body.firstChild);
+    }
+  }
+}
+
+// ── API ───────────────────────────────────────────────────────────────────────
+const BASE_PATH = '/sentinel';
+
+// ── CRASH / DEPLOY RECOVERY ─────────────────────────────────────────────────
+// Two ways this trips:
+//  1) "crash" — an in-flight user action fails repeatedly (fetch throws, or
+//     502/504 from the edge). Shown immediately since the user is waiting.
+//  2) "update" — a quiet background health check (runs every 15s regardless
+//     of user activity) starts failing. This is how we catch a Render
+//     redeploy even if nobody's clicking anything at the time.
+// On reconnect we compare the build's /api/health "version" (Render's
+// RENDER_GIT_COMMIT) against what we saw on page load — if it changed, that
+// confirms it really was a deploy and we say so; otherwise it was a same-build
+// crash/restart.
+let crashFailStreak = 0;
+let deployFailStreak = 0;
+let crashActive = false;
+let BUILD_VERSION = null;
+const CRASH_THRESHOLD = 2;
+const DEPLOY_POLL_MS = 15000;
+const crashRepairMessages = ['Diagnosing issue…', 'Reconnecting to server…', 'Restoring session…', 'Almost there…'];
+const updateRepairMessages = ['Waiting for the new build…', 'Still deploying…', 'Almost ready…'];
+
+async function fetchHealth() {
+  const r = await fetch(BASE_PATH + '/api/health', { cache: 'no-store' });
+  if (!r.ok) throw new Error('unhealthy');
+  return r.json();
+}
+
+function showCrashOverlay(mode) {
+  if (crashActive) return;
+  crashActive = true;
+  const dot = document.getElementById('crash-dot');
+  const sub = document.getElementById('crash-sub');
+  const msg = document.getElementById('crash-msg');
+  if (mode === 'update') {
+    dot.classList.add('updating');
+    sub.classList.add('updating');
+    sub.textContent = 'Updating';
+    msg.textContent = 'Sentinel is currently updating. Please stand by.';
+  } else {
+    dot.classList.remove('updating');
+    sub.classList.remove('updating');
+    sub.textContent = 'Critical Error';
+    msg.textContent = 'Sentinel has encountered a critical error and is automatically repairing itself.';
+  }
+  document.getElementById('crash-overlay').classList.remove('hidden');
+  startCrashRepairLoop(mode);
+}
+
+function hideCrashOverlay() {
+  crashActive = false;
+  crashFailStreak = 0;
+  deployFailStreak = 0;
+  document.getElementById('crash-overlay').classList.add('hidden');
+}
+
+function startCrashRepairLoop(mode) {
+  let attempt = 0;
+  const fill = document.getElementById('crash-bar-fill');
+  const status = document.getElementById('crash-status');
+  const messages = mode === 'update' ? updateRepairMessages : crashRepairMessages;
+  fill.style.width = '6%';
+
+  const tick = async () => {
+    if (!crashActive) return;
+    attempt++;
+    status.textContent = messages[Math.min(attempt - 1, messages.length - 1)];
+    fill.style.width = Math.min(6 + attempt * 10, 92) + '%';
+    try {
+      const data = await fetchHealth();
+      fill.style.width = '100%';
+      const versionChanged = BUILD_VERSION && data.version && data.version !== BUILD_VERSION;
+      status.textContent = versionChanged ? 'Update complete — reloading…' : 'Recovered — reloading…';
+      setTimeout(() => location.reload(), 600);
+      return;
+    } catch (e) { /* still down, keep polling */ }
+    setTimeout(tick, 1800);
+  };
+  tick();
+}
+
+// Silent background poll so a redeploy is caught even if the admin is idle
+(async function backgroundHealthPoll() {
+  try {
+    const data = await fetchHealth();
+    if (BUILD_VERSION === null) BUILD_VERSION = data.version;
+    deployFailStreak = 0;
+  } catch (e) {
+    if (!crashActive) {
+      deployFailStreak++;
+      if (deployFailStreak >= CRASH_THRESHOLD) showCrashOverlay('update');
+    }
+  }
+  setTimeout(backgroundHealthPoll, DEPLOY_POLL_MS);
+})();
+
+async function api(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  let r;
+  try { r = await fetch(BASE_PATH + path, opts); }
+  catch(e) {
+    crashFailStreak++;
+    if (crashFailStreak >= CRASH_THRESHOLD) showCrashOverlay('crash');
+    throw new Error('Network error please check your connection');
+  }
+  if (r.status === 502 || r.status === 504) {
+    crashFailStreak++;
+    if (crashFailStreak >= CRASH_THRESHOLD) showCrashOverlay('crash');
+  } else if (r.ok) {
+    crashFailStreak = 0;
+    if (crashActive) hideCrashOverlay();
+  }
+  let data;
+  try { data = await r.json(); }
+  catch(e) {
+    if (!r.ok) throw new Error(`Server error ${r.status} Internal Server Error`);
+    throw new Error(`Unexpected non-JSON response from server (${r.status})`);
+  }
+  if (!r.ok) {
+    // FastAPI validation errors come as {detail: [{loc, msg, type}...]} — flatten to readable string
+    const det = data.detail;
+    let msg;
+    if (typeof det === 'string') msg = det;
+    else if (Array.isArray(det)) msg = det.map(e => `${e.loc?.join('.')}: ${e.msg}`).join('; ');
+    else if (det) msg = JSON.stringify(det);
+    else msg = data.error || `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+function pid() { return STATE.profileId; }
+
+// ── TOAST ─────────────────────────────────────────────────────────────────────
+function toast(msg, type='') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
+
+// ── TABS ──────────────────────────────────────────────────────────────────────
+function showTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.querySelectorAll('.nav-tab').forEach(t => {
+    if (t.textContent.trim().toLowerCase().startsWith(name.slice(0,4))) t.classList.add('active');
+  });
+  if (name === 'history') { document.getElementById('history-badge').classList.remove('show'); refreshHistory(); }
+  if (name === 'config') { buildAssetFilterGrid(); buildWlTabs(); }
+  if (name === 'admin') { loadAdminRequests(); loadAdminProfiles(); }
+}
+
+// ── PROFILE SCREEN ────────────────────────────────────────────────────────────
+async function loadProfileScreen() {
+  const grid = document.getElementById('profile-grid');
+  if (!grid) return;
+  grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);padding:20px 0;">Loading profiles…</div>';
+  try {
+    const raw = await api('GET', '/api/profiles');
+
+    // Guard: FastAPI should return an array — if it doesn't, surface the real error
+    if (!Array.isArray(raw)) {
+      const msg = raw?.detail || raw?.error || JSON.stringify(raw);
+      throw new Error('Unexpected response from server: ' + msg);
+    }
+    const profiles = raw;
+    grid.innerHTML = '';
+
+    if (!profiles.length) {
+      const msg = document.createElement('div');
+      msg.style.cssText = 'grid-column:1/-1;text-align:center;font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);letter-spacing:1px;padding:20px 0;';
+      msg.textContent = 'No profiles yet — create one to get started';
+      grid.appendChild(msg);
     }
 
-async def get_username(user_id: str, cookie=None) -> str:
-    try:
-        r = await rblx_get(f"https://users.roblox.com/v1/users/{user_id}", cookie=cookie)
-        if r.status_code == 200:
-            d = r.json()
-            return d.get("displayName") or d.get("name") or user_id
-    except Exception:
-        pass
-    return user_id
-
-async def get_group_name(group_id: str, cookie=None) -> str:
-    try:
-        r = await rblx_get(f"https://groups.roblox.com/v1/groups/{group_id}", cookie=cookie)
-        if r.status_code == 200:
-            return r.json().get("name", f"Group {group_id}")
-    except Exception:
-        pass
-    return f"Group {group_id}"
-
-async def fetch_group_assets(group_id: str, asset_type: str, *, cookie=None) -> list[dict] | None:
-    """Returns assets on success, None on permanent/unrecoverable failure only.
-    Recoverable errors (429, network blips, temp outages) are retried with backoff
-    and return an empty list rather than None so the caller doesn't blacklist the type."""
-    if not cookie:
-        return None
-    assets: list[dict] = []
-    cursor = None
-    try:
-        csrf = await get_csrf(cookie)
-    except Exception:
-        csrf = ""
-
-    for page in range(10):
-        params = {"assetType": asset_type, "isArchived": "false", "groupId": group_id, "pageSize": 100}
-        if cursor:
-            params["cursor"] = cursor
-
-        # Retry loop for recoverable errors (429, network blips)
-        last_err = None
-        for attempt in range(3):
-            try:
-                async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-                    r = await c.get(
-                        "https://itemconfiguration.roblox.com/v1/creations/get-assets",
-                        cookies={".ROBLOSECURITY": cookie},
-                        headers={"X-CSRF-TOKEN": csrf} if csrf else {},
-                        params=params,
-                    )
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                sentinel_log(f"fetch_group_assets network error attempt {attempt+1} ({asset_type} grp {group_id}): {e}", "WARN", "NETWORK")
-                await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
-        if last_err:
-            # All network attempts failed — recoverable, return empty list not None
-            sentinel_log(f"fetch_group_assets gave up after 3 network attempts ({asset_type} grp {group_id}) — skipping this poll cycle", "ERROR", "NETWORK")
-            return []
-
-        # 401 — cookie expired, this is permanent until cookie changes
-        if r.status_code == 401:
-            sentinel_log(f"fetch_group_assets 401 — cookie expired ({asset_type} grp {group_id})", "ERROR", "NETWORK")
-            return None
-
-        # 429 — rate limited, back off and return empty list (NOT None — don't blacklist)
-        if r.status_code == 429:
-            retry_after = int(r.headers.get("Retry-After", 10))
-            sentinel_log(f"fetch_group_assets 429 rate limited ({asset_type} grp {group_id}) — backing off {retry_after}s", "WARN", "NETWORK")
-            await asyncio.sleep(min(retry_after, 30))
-            return []  # skip this poll cycle, try again next time
-
-        # 403 — could be CSRF or could be permanent permission denied
-        if r.status_code == 403:
-            new_csrf = r.headers.get("x-csrf-token")
-            if new_csrf and new_csrf != csrf:
-                # CSRF was stale — refresh and retry this page once
-                csrf = new_csrf
-                _csrf_cache[cookie] = (new_csrf, time.time())
-                sentinel_log(f"fetch_group_assets 403 CSRF refresh ({asset_type} grp {group_id}) — retrying", "DEBUG", "NETWORK")
-                try:
-                    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c2:
-                        r = await c2.get(
-                            "https://itemconfiguration.roblox.com/v1/creations/get-assets",
-                            cookies={".ROBLOSECURITY": cookie},
-                            headers={"X-CSRF-TOKEN": csrf},
-                            params=params,
-                        )
-                except Exception as e2:
-                    sentinel_log(f"fetch_group_assets CSRF retry network error: {e2}", "ERROR", "NETWORK")
-                    return []  # recoverable
-                if r.status_code == 200:
-                    pass  # fall through to data parsing below
-                elif r.status_code == 429:
-                    sentinel_log(f"fetch_group_assets 429 after CSRF retry ({asset_type} grp {group_id})", "WARN", "NETWORK")
-                    await asyncio.sleep(10)
-                    return []
-                else:
-                    # Still failing after CSRF refresh — this is a permanent permission issue
-                    sentinel_log(f"fetch_group_assets persistent 403 ({asset_type} grp {group_id}) — treating as unsupported", "WARN", "NETWORK")
-                    return None  # caller will mark as unsupported
-            else:
-                # 403 with no CSRF refresh available — permanent permission denied
-                sentinel_log(f"fetch_group_assets 403 no CSRF ({asset_type} grp {group_id}) — unsupported", "WARN", "NETWORK")
-                return None
-
-        # Any other non-200 — treat as recoverable (Roblox has random 500s/502s)
-        if r.status_code != 200:
-            sentinel_log(f"fetch_group_assets HTTP {r.status_code} ({asset_type} grp {group_id}) — skipping poll cycle: {r.text[:120]}", "WARN", "NETWORK")
-            return []  # NOT None — don't blacklist
-
-        d = r.json()
-        for item in d.get("data", []):
-            assets.append({
-                "id":          str(item.get("assetId", item.get("id", ""))),
-                "name":        item.get("name", "Unknown"),
-                "creatorId":   str(item.get("creatorTargetId", "")),
-                "creatorName": item.get("creatorName", "") or "",
-                "assetType":   asset_type,
-            })
-        cursor = d.get("nextPageCursor")
-        if not cursor:
-            break
-
-    return assets
-
-async def archive_asset(asset_id: str, *, cookie=None) -> bool:
-    if not cookie:
-        return False
-    csrf = await get_csrf(cookie)
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(
-            f"https://develop.roblox.com/v1/assets/{asset_id}/archive",
-            headers={"X-CSRF-TOKEN": csrf},
-            cookies={".ROBLOSECURITY": cookie},
-        )
-        sentinel_log(f"Archive {asset_id}: HTTP {r.status_code}", "ARCHIVE", "NETWORK")
-        if r.status_code == 403:
-            new_csrf = r.headers.get("x-csrf-token")
-            if new_csrf:
-                _csrf_cache[cookie] = (new_csrf, time.time())
-                sentinel_log(f"CSRF expired for {asset_id} — refreshed and retrying", "DEBUG", "NETWORK")
-                r2 = await c.post(
-                    f"https://develop.roblox.com/v1/assets/{asset_id}/archive",
-                    headers={"X-CSRF-TOKEN": new_csrf},
-                    cookies={".ROBLOSECURITY": cookie},
-                )
-                sentinel_log(f"Archive retry {asset_id}: HTTP {r2.status_code}", "ARCHIVE", "NETWORK")
-                return r2.status_code in (200, 204)
-        return r.status_code in (200, 204)
-
-async def restore_asset(asset_id: str, *, cookie=None) -> bool:
-    """Call the Roblox restore endpoint for a previously-archived asset.
-    Mirrors archive_asset() exactly, including CSRF retry on 403.
-    """
-    if not cookie:
-        return False
-    csrf = await get_csrf(cookie)
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(
-            f"https://develop.roblox.com/v1/assets/{asset_id}/restore",
-            headers={"X-CSRF-TOKEN": csrf},
-            cookies={".ROBLOSECURITY": cookie},
-        )
-        sentinel_log(f"Restore {asset_id}: HTTP {r.status_code}", "ARCHIVE", "NETWORK")
-        if r.status_code == 403:
-            new_csrf = r.headers.get("x-csrf-token")
-            if new_csrf:
-                _csrf_cache[cookie] = (new_csrf, time.time())
-                sentinel_log(f"CSRF expired for restore {asset_id} — refreshed and retrying", "DEBUG", "NETWORK")
-                r2 = await c.post(
-                    f"https://develop.roblox.com/v1/assets/{asset_id}/restore",
-                    headers={"X-CSRF-TOKEN": new_csrf},
-                    cookies={".ROBLOSECURITY": cookie},
-                )
-                sentinel_log(f"Restore retry {asset_id}: HTTP {r2.status_code}", "ARCHIVE", "NETWORK")
-                return r2.status_code in (200, 204)
-        return r.status_code in (200, 204)
-
-
-async def send_dm(user_id: str, subject: str, body: str, cookie: str) -> bool:
-    csrf = await get_csrf(cookie)
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(
-            "https://privatemessages.roblox.com/v1/messages",
-            headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
-            cookies={".ROBLOSECURITY": cookie},
-            json={"userId": int(user_id), "subject": subject, "body": body},
-        )
-        return r.status_code in (200, 204)
-
-# ── MONITORING LOOP ───────────────────────────────────────────────────────────
-
-async def monitor_loop(profile_id: str):
-    session = get_session(profile_id)
-    sentinel_log(f"Monitor loop started for profile {profile_id[:8]}", "INFO", "MONITOR")
-    consecutive_errors = 0
-
-    while session.monitoring:
-        cycle_start = time.time()
-        try:
-            # ── CONFIG ────────────────────────────────────────────────────────
-            try:
-                cfg = get_config(profile_id)
-            except Exception as e:
-                sentinel_log(f"Config load failed: {e} — using defaults", "WARN", "MONITOR")
-                cfg = {}
-
-            poll_sec         = max(10, int(cfg.get("pollingInterval", 60)))
-            delay_sec        = max(0,  int(cfg.get("archiveDelay", 0)))
-            archive_existing = bool(cfg.get("archiveExisting", False))
-            asset_filters    = cfg.get("assetTypeFilters", ALL_ASSET_TYPES) or ALL_ASSET_TYPES
-            whitelist_all    = {str(u).strip().lower() for u in (cfg.get("whitelist_all") or [])}
-
-            # ── GROUPS ────────────────────────────────────────────────────────
-            try:
-                groups = db_exec(
-                    "SELECT id, name FROM groups WHERE profile_id=?", (profile_id,), fetch="all"
-                ) or []
-            except Exception as e:
-                sentinel_log(f"DB error loading groups: {e} — skipping cycle", "ERROR", "MONITOR")
-                groups = []
-
-            if not groups:
-                sentinel_log(f"No groups configured for {profile_id[:8]} — sleeping {poll_sec}s", "DEBUG", "MONITOR")
-
-            for grp in groups:
-                if not session.monitoring:
-                    break
-                gid   = grp["id"]
-                gname = grp["name"]
-
-                # ── PER-GROUP SCAN ────────────────────────────────────────────
-                try:
-                    all_assets: list[dict] = []
-                    active_filters = asset_filters[:3] if _DEGRADED else asset_filters
-                    if _DEGRADED:
-                        sentinel_log(f"Degraded mode — limiting to {active_filters}", "MEMORY", "MONITOR")
-
-                    for asset_type in active_filters:
-                        if not session.monitoring:
-                            break
-
-                        skip_key = (gid, asset_type)
-                        if skip_key in _unsupported_group_types:
-                            age = time.time() - _unsupported_group_types[skip_key]
-                            if age < _UNSUPPORTED_RECHECK_SECS:
-                                continue
-                            else:
-                                del _unsupported_group_types[skip_key]
-                                sentinel_log(f"Rechecking {asset_type} grp {gid} (blacklisted {age/60:.0f}m ago)", "DEBUG", "MONITOR")
-
-                        sentinel_log(f"Scanning grp {gid} ({gname}) for {asset_type}", "DEBUG", "NETWORK")
-
-                        try:
-                            type_assets = await fetch_group_assets(
-                                gid, asset_type, cookie=session.cookie
-                            )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as e:
-                            sentinel_log(f"fetch_group_assets threw unexpectedly ({asset_type} grp {gid}): {e} — skipping type this cycle", "ERROR", "MONITOR")
-                            continue
-
-                        if type_assets is None:
-                            _unsupported_group_types[skip_key] = time.time()
-                            sentinel_log(f"{asset_type} grp {gid} — permanent error, rechecking in {_UNSUPPORTED_RECHECK_SECS//60}m", "WARN", "MONITOR")
-                            continue
-
-                        sentinel_log(f"Found {len(type_assets)} {asset_type} in grp {gid}", "DEBUG", "NETWORK")
-                        all_assets.extend(type_assets)
-
-                    # ── DIFF ─────────────────────────────────────────────────
-                    try:
-                        current     = {a["id"]: a for a in all_assets}
-                        current_ids = set(current)
-                        group_key   = f"{profile_id}:{gid}"
-
-                        if group_key not in session.known_assets:
-                            session.known_assets[group_key] = current_ids
-                            sentinel_log(f"Baseline grp {gid} ({gname}): {len(current_ids)} assets", "INFO", "MONITOR")
-                            new_ids = current_ids if archive_existing else set()
-                        else:
-                            new_ids = current_ids - session.known_assets[group_key]
-                            session.known_assets[group_key] -= (session.known_assets[group_key] - current_ids)
-                    except Exception as e:
-                        sentinel_log(f"Diff error grp {gid}: {e} — skipping archive step this cycle", "ERROR", "MONITOR")
-                        continue
-
-                    # ── ARCHIVE LOOP ──────────────────────────────────────────
-                    for aid in new_ids:
-                        if not session.monitoring:
-                            break
-                        try:
-                            a            = current.get(aid, {})
-                            creator_id   = str(a.get("creatorId", "") or "")
-                            creator_name = str(a.get("creatorName", "") or "")
-
-                            if not creator_name and creator_id:
-                                try:
-                                    creator_name = await get_username(creator_id, cookie=session.cookie)
-                                except Exception:
-                                    creator_name = creator_id
-
-                            asset_type = a.get("assetType", "Unknown")
-
-                            def _in_wl(wl_set):
-                                return (
-                                    creator_id.strip().lower() in wl_set or
-                                    creator_name.strip().lower() in wl_set
-                                )
-
-                            if _in_wl(whitelist_all):
-                                sentinel_log(f"Global whitelist skip: {creator_name} ({asset_type} {aid})", "INFO", "MONITOR")
-                                session.known_assets[group_key].add(aid)
-                                continue
-
-                            try:
-                                type_wl = {str(u).strip().lower() for u in (cfg.get(f"whitelist_{asset_type}") or [])}
-                            except Exception:
-                                type_wl = set()
-                            if _in_wl(type_wl):
-                                sentinel_log(f"Type whitelist skip: {creator_name} ({asset_type})", "INFO", "MONITOR")
-                                session.known_assets[group_key].add(aid)
-                                continue
-
-                            sentinel_log(f"New {asset_type}: '{a.get('name')}' (ID {aid}) by {creator_name}", "ARCHIVE", "MONITOR")
-
-                            if asset_type in NON_ARCHIVABLE_TYPES:
-                                sentinel_log(f"Skipping {asset_type} {aid} — not archivable via API", "INFO", "MONITOR")
-                                session.known_assets[group_key].add(aid)
-                                continue
-
-                            try:
-                                was_restored = db_exec(
-                                    "SELECT COUNT(*) FROM history WHERE audio_id=? AND profile_id=? AND archived=0",
-                                    (aid, profile_id), fetch="val"
-                                ) or 0
-                            except Exception:
-                                was_restored = 0
-
-                            if was_restored:
-                                sentinel_log(f"Skipping {aid} — manually restored", "INFO", "MONITOR")
-                                session.known_assets[group_key].add(aid)
-                                continue
-
-                            if delay_sec > 0:
-                                sentinel_log(f"Delay {delay_sec}s before archiving {aid}", "DEBUG", "MONITOR")
-                                try:
-                                    await asyncio.sleep(delay_sec)
-                                except asyncio.CancelledError:
-                                    raise
-                                if not session.monitoring:
-                                    break
-
-                            try:
-                                ok = await archive_asset(aid, cookie=session.cookie)
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception as e:
-                                sentinel_log(f"archive_asset threw for {aid}: {e} — marking failed, continuing", "ERROR", "MONITOR")
-                                ok = False
-
-                            sentinel_log(f"Archive {aid}: {'OK' if ok else 'FAILED'}", "ARCHIVE" if ok else "ERROR", "MONITOR")
-
-                            # Always add to known_assets even on failure to avoid retry loops
-                            session.known_assets[group_key].add(aid)
-
-                            try:
-                                db_insert_ignore("history", {
-                                    "id":           f"{aid}_{int(time.time())}",
-                                    "profile_id":   profile_id,
-                                    "username":     creator_name,
-                                    "display_name": creator_name,
-                                    "user_id":      creator_id,
-                                    "audio_name":   a.get("name", "Unknown"),
-                                    "audio_id":     aid,
-                                    "asset_type":   asset_type,
-                                    "group_id":     gid,
-                                    "group_name":   gname,
-                                    "time":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    "dm_status":    "n/a",
-                                    "archived":     1 if ok else 0,
-                                })
-                            except Exception as e:
-                                sentinel_log(f"DB write failed for {aid}: {e} — continuing", "ERROR", "MONITOR")
-
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as e:
-                            sentinel_log(f"Unexpected error processing asset {aid}: {e} — skipping", "ERROR", "MONITOR")
-                            try:
-                                session.known_assets[group_key].add(aid)
-                            except Exception:
-                                pass
-                            continue
-
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    sentinel_log(f"Unexpected error scanning group {gid}: {e} — skipping to next group", "ERROR", "MONITOR")
-                    continue
-
-            # ── END OF CYCLE ──────────────────────────────────────────────────
-            consecutive_errors = 0
-            _trim_memory()
-
-            elapsed   = time.time() - cycle_start
-            sleep_sec = poll_sec * 3 if _DEGRADED else poll_sec
-            actual_sleep = max(5, sleep_sec - elapsed)
-            sentinel_log(f"Cycle done in {elapsed:.1f}s — sleeping {actual_sleep:.0f}s", "DEBUG", "MONITOR")
-
-            slept = 0
-            while slept < actual_sleep and session.monitoring:
-                chunk = min(5, actual_sleep - slept)
-                await asyncio.sleep(chunk)
-                slept += chunk
-
-        except asyncio.CancelledError:
-            sentinel_log(f"Monitor loop cancelled for {profile_id[:8]}", "INFO", "MONITOR")
-            break
-        except Exception as e:
-            consecutive_errors += 1
-            backoff = min(30 * consecutive_errors, 120)
-            sentinel_log(
-                f"Monitor outer exception #{consecutive_errors}: {e} — backing off {backoff}s",
-                "ERROR", "MONITOR"
-            )
-            try:
-                await asyncio.sleep(backoff)
-            except asyncio.CancelledError:
-                break
-
-    sentinel_log(f"Monitor loop exited for {profile_id[:8]}", "INFO", "MONITOR")
-
-    # ── WATCHDOG ──────────────────────────────────────────────────────────────
-    if session.monitoring and session.cookie:
-        sentinel_log(
-            f"Monitor loop died unexpectedly (monitoring=True) for {profile_id[:8]} — restarting in 5s",
-            "WARN", "MONITOR"
-        )
-        await asyncio.sleep(5)
-        if session.monitoring and session.cookie:
-            _unsupported_group_types.clear()
-            session.monitor_task = asyncio.create_task(monitor_loop(profile_id))
-            sentinel_log(f"Monitor loop auto-restarted for {profile_id[:8]}", "INFO", "MONITOR")
-    else:
-        session.monitoring = False
-        sentinel_log(f"Monitor loop stopped cleanly for {profile_id[:8]}", "INFO", "MONITOR")
-
-
-# ── PYDANTIC MODELS ───────────────────────────────────────────────────────────
-
-class ProfileCreate(BaseModel):
-    name:        str
-    pin:         str
-    avatar_url:  str = ""
-    invite_code: str = ""
-
-class ProfileLogin(BaseModel):
-    profile_id: str
-    pin:        str
-
-class ProfileUpdate(BaseModel):
-    profile_id: str
-    pin:        str
-    new_pin:    Optional[str] = None
-    name:       Optional[str] = None
-    avatar_url: Optional[str] = None
-
-class ConnectCodeBody(BaseModel):
-    code:   str
-    cookie: str
-
-class GenerateCodeBody(BaseModel):
-    profile_id: str
-
-class GroupBody(BaseModel):
-    id:         str
-    name:       str = ""
-    profile_id: str
-
-class ConfigBody(BaseModel):
-    profile_id:           str
-    pollingInterval:      Optional[int]       = None
-    allowFastPolling:     Optional[bool]      = None
-    archiveDelay:         Optional[int]       = None
-    archiveExisting:      Optional[bool]      = None
-    saveCookies:          Optional[bool]      = None
-    cookieSaveMode:       Optional[str]       = None
-    autoStartMonitoring:  Optional[bool]      = None
-    assetTypeFilters:     Optional[List[str]] = None
-    whitelist_Audio:      Optional[List[str]] = None
-    whitelist_Image:      Optional[List[str]] = None
-    whitelist_Decal:      Optional[List[str]] = None
-    whitelist_Video:      Optional[List[str]] = None
-    whitelist_Mesh:       Optional[List[str]] = None
-    whitelist_Plugin:     Optional[List[str]] = None
-    whitelist_Animation:  Optional[List[str]] = None
-    whitelist_Model:      Optional[List[str]] = None
-    whitelist_Package:    Optional[List[str]] = None
-    whitelist_all:        Optional[List[str]] = None
-
-class MonitorBody(BaseModel):
-    profile_id: str
-
-class RestoreBody(BaseModel):
-    profile_id: str
-    asset_id:   str
-    history_id: Optional[str] = None  # if provided, marks that history row as archived=0
-
-class RestoreBulkBody(BaseModel):
-    profile_id: str
-    asset_ids:  List[str]
-
-class AccessRequestBody(BaseModel):
-    name:   str
-    reason: str
-    email:  str
-
-class AccessRequestAction(BaseModel):
-    request_id: str
-    action:     str
-    admin_id:   str
-    admin_pin:  str
-
-class GenerateInviteBody(BaseModel):
-    admin_id:  str
-    admin_pin: str
-
-class SetAdminBody(BaseModel):
-    admin_id:     str
-    admin_pin:    str
-    target_id:    str
-    is_admin:     bool
-
-# ── PROFILE ROUTES ────────────────────────────────────────────────────────────
-
-@app.get("/api/profiles")
-def api_list_profiles():
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        try:
-            cur.execute("SELECT id, name, avatar_url, created_at, pin_length, is_admin FROM profiles ORDER BY created_at")
-        except Exception:
-            conn.rollback()
-            cur.execute("SELECT id, name, avatar_url, created_at FROM profiles ORDER BY created_at")
-        rows = cur.fetchall()
-        result = []
-        for r in rows:
-            d = dict(r); d.setdefault("pin_length", 4); d.setdefault("is_admin", False)
-            result.append(d)
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-@app.post("/api/profiles")
-def api_create_profile(body: ProfileCreate):
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    if not body.name.strip():
-        raise HTTPException(400, "Name is required")
-    if len(body.pin) < 4:
-        raise HTTPException(400, "PIN must be at least 4 digits")
-    if len(body.pin) > 8:
-        raise HTTPException(400, "PIN must be at most 8 digits")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        code = (body.invite_code or "").strip().upper()
-        if not code:
-            raise HTTPException(403, "An invite code is required")
-        cur.execute("SELECT used FROM invite_codes WHERE code=%s", (code,))
-        inv = cur.fetchone()
-        if not inv:
-            raise HTTPException(403, "Invalid invite code")
-        if inv["used"]:
-            raise HTTPException(403, "Invite code already used")
-        profile_id = str(uuid.uuid4())
-        pin_len = len(body.pin)
-        cur.execute(
-            "INSERT INTO profiles (id, name, pin_hash, avatar_url, pin_length, is_admin) VALUES (%s,%s,%s,%s,%s,%s)",
-            (profile_id, body.name.strip(), hash_pin(body.pin), body.avatar_url, pin_len, False)
-        )
-        cur.execute("UPDATE invite_codes SET used=TRUE, used_by=%s WHERE code=%s", (profile_id, code))
-        conn.commit()
-        return {"id": profile_id, "name": body.name.strip(), "avatar_url": body.avatar_url,
-                "pin_length": pin_len, "is_admin": False}
-    except HTTPException:
-        conn.rollback(); raise
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-@app.post("/api/profiles/login")
-def api_login_profile(body: ProfileLogin):
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    conn = get_pg()
-    cur  = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id, name, avatar_url FROM profiles WHERE id=%s AND pin_hash=%s",
-            (body.profile_id, hash_pin(body.pin))
-        )
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(401, "Invalid PIN")
-
-        saved_cookie  = None
-        saved_account = None
-        saved_accounts_list = []
-        cur.execute(
-            "SELECT roblox_user_id, cookie_encrypted, account_info FROM saved_credentials WHERE profile_id=%s ORDER BY saved_at DESC",
-            (body.profile_id,)
-        )
-        creds = cur.fetchall()
-        if creds:
-            # Use most recent as active session
-            first = creds[0]
-            saved_cookie  = first["cookie_encrypted"]
-            saved_account = first["account_info"]
-            for c in creds:
-                info_entry = c["account_info"]
-                if isinstance(info_entry, str):
-                    try: info_entry = json.loads(info_entry)
-                    except: info_entry = {}
-                if info_entry:
-                    saved_accounts_list.append(info_entry)
-
-        if saved_cookie and saved_account:
-            session = get_session(body.profile_id)
-            session.cookie       = saved_cookie
-            session.account_info = saved_account
-            # Auto-restart monitoring if it was active and server was restarted
-            cfg_check = get_config(body.profile_id)
-            if cfg_check.get("_monitoringActive") and not session.monitoring:
-                session.monitoring   = True
-                session.monitor_task = asyncio.create_task(monitor_loop(body.profile_id))
-                print(f"[SENTINEL] Auto-restarted monitoring on login for profile {body.profile_id}")
-
-        return {
-            "id":            row["id"],
-            "name":          row["name"],
-            "avatar_url":    row["avatar_url"],
-            "hasCredential": bool(saved_cookie),
-            "account":       saved_account,
-            "savedAccounts": saved_accounts_list,
+    profiles.forEach(p => {
+      const card = document.createElement('div');
+      card.className = 'profile-card';
+      const initials = (p.name || '?').slice(0,2).toUpperCase();
+      card.innerHTML = `
+        <button class="profile-delete-btn" title="Delete profile">✕</button>
+        <div class="profile-card-avatar">
+          ${p.avatar_url ? `<img src="${esc(p.avatar_url)}" onerror="this.style.display='none'">` : initials}
+        </div>
+        <div class="profile-card-name">${esc(p.name)}</div>
+        <div class="profile-card-sub">Click to sign in</div>`;
+      card.querySelector('.profile-delete-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteProfileFromSelector(p);
+      });
+      card.onclick = () => openPinModal(p);
+      grid.appendChild(card);
+    });
+
+    const inviteCard = document.createElement('div');
+    inviteCard.className = 'profile-card add-card';
+    inviteCard.innerHTML = `
+      <div class="profile-card-avatar" style="font-size:24px;color:rgba(255,255,255,0.3);">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      </div>
+      <div class="profile-card-name" style="color:var(--text-dim);">Join</div>
+      <div class="profile-card-sub">I have an invite code</div>`;
+    inviteCard.onclick = () => document.getElementById('create-profile-modal').classList.add('open');
+    grid.appendChild(inviteCard);
+
+    const reqCard = document.createElement('div');
+    reqCard.className = 'profile-card add-card';
+    reqCard.innerHTML = `
+      <div class="profile-card-avatar" style="font-size:24px;color:rgba(255,255,255,0.3);">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+      </div>
+      <div class="profile-card-name" style="color:var(--text-dim);">Request Access</div>
+      <div class="profile-card-sub">Apply for an invite</div>`;
+    reqCard.onclick = () => document.getElementById('request-access-modal').classList.add('open');
+    grid.appendChild(reqCard);
+
+  } catch(e) {
+    console.error('[SENTINEL] loadProfileScreen error:', e);
+    grid.innerHTML = `
+      <div style="grid-column:1/-1;font-family:var(--font-mono);font-size:11px;color:#ff6b6b;padding:16px;text-align:center;border:1px solid rgba(255,59,59,0.2);border-radius:8px;background:rgba(255,59,59,0.04);">
+        <div style="font-size:13px;margin-bottom:6px;">⚠ Could not load profiles</div>
+        <div style="color:rgba(255,100,100,0.7);font-size:10px;">${esc(e.message)}</div>
+        <button onclick="loadProfileScreen()" style="margin-top:10px;padding:5px 14px;border:1px solid rgba(255,59,59,0.3);border-radius:5px;background:transparent;color:#ff6b6b;cursor:pointer;font-family:var(--font-mono);font-size:10px;">Retry</button>
+      </div>`;
+  }
+}
+
+// ── REQUEST ACCESS ────────────────────────────────────────────────────────────
+
+function closeRequestAccess() {
+  document.getElementById('request-access-modal').classList.remove('open');
+  document.getElementById('req-name').value = '';
+  document.getElementById('req-email').value = '';
+  document.getElementById('req-reason').value = '';
+  document.getElementById('request-access-success').style.display = 'none';
+  document.getElementById('request-access-form').style.display = '';
+}
+
+async function submitAccessRequest() {
+  const name   = document.getElementById('req-name').value.trim();
+  const email  = document.getElementById('req-email').value.trim();
+  const reason = document.getElementById('req-reason').value.trim();
+  if (!name)   { toast('Enter your name', 'error'); return; }
+  if (!email)  { toast('Enter your email', 'error'); return; }
+  if (!reason) { toast('Enter a reason', 'error'); return; }
+  try {
+    await api('POST', '/api/access/request', { name, email, reason });
+    document.getElementById('request-access-form').style.display = 'none';
+    document.getElementById('request-access-success').style.display = '';
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+// ── ADMIN PANEL ───────────────────────────────────────────────────────────────
+
+let _generatedCode = '';
+
+async function adminGenerateInvite() {
+  try {
+    const res = await api('POST', '/api/admin/generate-invite', {
+      admin_id: STATE.profileId, admin_pin: STATE._lastPin
+    });
+    _generatedCode = res.code;
+    const box = document.getElementById('generated-code-box');
+    box.textContent = res.code;
+    box.style.display = '';
+    toast('Code generated — click it to copy', 'success');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+function copyGeneratedCode() {
+  navigator.clipboard.writeText(_generatedCode).then(() => toast('Copied!', 'success'));
+}
+
+async function loadAdminRequests() {
+  const loading = document.getElementById('admin-requests-loading');
+  const list    = document.getElementById('admin-requests-list');
+  const empty   = document.getElementById('admin-requests-empty');
+  loading.style.display = ''; list.innerHTML = ''; empty.style.display = 'none';
+  try {
+    const reqs = await api('GET', `/api/admin/requests?profile_id=${STATE.profileId}&pin=${encodeURIComponent(STATE._lastPin)}`);
+    loading.style.display = 'none';
+    if (!reqs.length) { empty.style.display = ''; return; }
+    reqs.forEach(r => {
+      const statusColor = r.status === 'approved' ? 'var(--accent)' : r.status === 'denied' ? '#ef4444' : '#f5a623';
+      const el = document.createElement('div');
+      el.style.cssText = 'background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:14px;';
+      el.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px;">
+          <div>
+            <div style="font-family:var(--font-display);font-weight:800;font-size:14px;color:#fff;">${esc(r.name)}</div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);">${esc(r.email)} · ${new Date(r.created_at).toLocaleString()}</div>
+          </div>
+          <span style="font-family:var(--font-mono);font-size:10px;color:${statusColor};border:1px solid ${statusColor};padding:2px 8px;border-radius:4px;white-space:nowrap;">${r.status.toUpperCase()}</span>
+        </div>
+        <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:${r.status==='pending'?'10':'0'}px;">${esc(r.reason)}</div>
+        ${r.status === 'approved' && r.invite_code ? `<div style="font-family:var(--font-mono);font-size:11px;color:var(--accent);margin-bottom:10px;">Invite Code: <strong>${esc(r.invite_code)}</strong></div>` : ''}
+        ${r.status === 'pending' ? `<div style="display:flex;gap:8px;">
+          <button class="btn btn-sm btn-primary" style="flex:1;" onclick="adminReviewRequest('${r.id}','approve')">✓ Approve</button>
+          <button class="btn btn-sm" style="flex:1;border-color:#ef4444;color:#ef4444;" onclick="adminReviewRequest('${r.id}','deny')">✕ Deny</button>
+        </div>` : ''}`;
+      list.appendChild(el);
+    });
+  } catch(e) { loading.textContent = 'Error loading requests: ' + e.message; }
+}
+
+async function adminReviewRequest(requestId, action) {
+  // Generate a fresh token pair then immediately use the right one
+  try {
+    // We'll call the same review POST by fetching the token from the DB via a helper endpoint
+    // Since we're already authenticated as admin, use the direct action endpoint
+    const code = action === 'approve'
+      ? "".padStart(0) // placeholder, backend generates
+      : null;
+    // Directly update via admin action (reuse generate-invite + update request)
+    if (action === 'approve') {
+      const inv = await api('POST', '/api/admin/generate-invite', {
+        admin_id: STATE.profileId, admin_pin: STATE._lastPin
+      });
+      // Mark request approved with this code
+      await api('POST', '/api/admin/approve-request', {
+        admin_id: STATE.profileId, admin_pin: STATE._lastPin,
+        request_id: requestId, invite_code: inv.code
+      });
+      toast(`Approved! Code: ${inv.code}`, 'success');
+    } else {
+      await api('POST', '/api/admin/deny-request', {
+        admin_id: STATE.profileId, admin_pin: STATE._lastPin,
+        request_id: requestId
+      });
+      toast('Request denied', 'warn');
+    }
+    loadAdminRequests();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function loadAdminProfiles() {
+  const loading = document.getElementById('admin-profiles-loading');
+  const list    = document.getElementById('admin-profiles-list');
+  loading.style.display = ''; list.innerHTML = '';
+  try {
+    const profiles = await api('GET', '/api/profiles');
+    loading.style.display = 'none';
+    profiles.forEach(p => {
+      const el = document.createElement('div');
+      el.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);';
+      el.innerHTML = `
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="width:32px;height:32px;border-radius:50%;background:var(--surface3);border:1px solid var(--border);overflow:hidden;display:flex;align-items:center;justify-content:center;font-family:var(--font-display);font-weight:800;font-size:12px;flex-shrink:0;">
+            ${p.avatar_url ? `<img src="${esc(p.avatar_url)}" style="width:100%;height:100%;object-fit:cover;">` : p.name.slice(0,2).toUpperCase()}
+          </div>
+          <div>
+            <div style="font-family:var(--font-display);font-weight:700;font-size:13px;color:#fff;">${esc(p.name)} ${p.is_admin ? '<span style="font-size:10px;color:var(--accent);font-family:var(--font-mono);">ADMIN</span>' : ''}</div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);">${p.id}</div>
+          </div>
+        </div>
+        ${p.id !== STATE.profileId ? `
+        <button class="btn btn-sm" onclick="adminToggleAdmin('${p.id}', ${!p.is_admin})" style="${p.is_admin ? 'border-color:#ef4444;color:#ef4444;' : ''}">
+          ${p.is_admin ? 'Remove Admin' : 'Make Admin'}
+        </button>` : '<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);">You</span>'}`;
+      list.appendChild(el);
+    });
+  } catch(e) { loading.textContent = 'Error loading profiles: ' + e.message; }
+}
+
+async function adminToggleAdmin(targetId, makeAdmin) {
+  try {
+    await api('POST', '/api/admin/set-admin', {
+      admin_id: STATE.profileId, admin_pin: STATE._lastPin,
+      target_id: targetId, is_admin: makeAdmin
+    });
+    toast(makeAdmin ? 'Admin granted' : 'Admin removed', 'success');
+    loadAdminProfiles();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+// ── PIN MODAL ─────────────────────────────────────────────────────────────────
+let _pinTarget    = null;
+let _pinValue     = '';
+let _pinLength    = 4;  // actual PIN length for this profile
+let _pinSubmitTimer = null;
+
+function openPinModal(profile) {
+  _pinTarget = profile;
+  _pinValue  = '';
+  _pinLength = profile.pin_length || 4;  // backend sends pin_length, default 4
+  document.getElementById('pin-modal-name').textContent = profile.name;
+  document.getElementById('pin-error').textContent = '';
+  const avatarEl = document.getElementById('pin-modal-avatar');
+  avatarEl.innerHTML = profile.avatar_url
+    ? `<img src="${esc(profile.avatar_url)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" onerror="this.style.display='none'">`
+    : profile.name.slice(0,2).toUpperCase();
+  updatePinDots();
+  document.getElementById('pin-modal').classList.add('open');
+  // Enable keyboard input
+  document.addEventListener('keydown', _pinKeyHandler);
+}
+
+function closePinModal() {
+  document.getElementById('pin-modal').classList.remove('open');
+  _pinValue = ''; _pinTarget = null;
+  clearTimeout(_pinSubmitTimer);
+  document.removeEventListener('keydown', _pinKeyHandler);
+  document.getElementById('pin-display').innerHTML =
+    Array.from({length: _pinLength}, () => '<div class="pin-dot"></div>').join('');
+}
+
+function _pinKeyHandler(e) {
+  if (e.key >= '0' && e.key <= '9') { pinKey(e.key); }
+  else if (e.key === 'Backspace') { pinBackspace(); }
+  else if (e.key === 'Escape') { closePinModal(); }
+}
+
+function updatePinDots() {
+  const display = document.getElementById('pin-display');
+  const entered = _pinValue.length;
+  // Show exact PIN length slots — grows as user types beyond known length
+  const total = Math.max(_pinLength, entered);
+  display.innerHTML = Array.from({length: total}, (_, i) =>
+    `<div class="pin-dot ${i < entered ? 'filled' : ''}"></div>`
+  ).join('');
+}
+
+function pinKey(digit) {
+  if (_pinValue.length >= 8) return;
+  _pinValue += digit;
+  updatePinDots();
+  clearTimeout(_pinSubmitTimer);
+  // Submit when we hit the known PIN length, or after 800ms pause if longer
+  if (_pinValue.length === _pinLength) {
+    _pinSubmitTimer = setTimeout(() => submitPin(), 300);
+  } else if (_pinValue.length === 8) {
+    submitPin();
+  } else if (_pinValue.length > _pinLength) {
+    _pinSubmitTimer = setTimeout(() => submitPin(), 800);
+  }
+}
+
+function pinBackspace() {
+  _pinValue = _pinValue.slice(0,-1);
+  updatePinDots();
+  document.getElementById('pin-error').textContent = '';
+}
+
+async function submitPin() {
+  if (!_pinTarget) return;
+  clearTimeout(_pinSubmitTimer);
+  try {
+    const res = await api('POST', '/api/profiles/login', { profile_id: _pinTarget.id, pin: _pinValue });
+    STATE._lastPin = _pinValue;
+    res.is_admin   = _pinTarget.is_admin || false;
+    document.getElementById('pin-modal').classList.remove('open');
+    openExeMigrateScreen(_pinTarget.id, _pinValue, res);
+  } catch(e) {
+    document.getElementById('pin-error').textContent = 'Wrong PIN — try again';
+    _pinValue = '';
+    updatePinDots();
+  }
+}
+
+// ── CREATE PROFILE ────────────────────────────────────────────────────────────
+async function deleteProfileFromSelector(profile) {
+  const pin = prompt(`Enter PIN for "${profile.name}" to delete this profile.\nTHIS CANNOT BE UNDONE.`);
+  if (pin === null || pin.trim() === '') return;
+  try {
+    await api('DELETE', `/api/profiles/${profile.id}?pin=${encodeURIComponent(pin.trim())}`);
+    toast('Profile deleted', 'warn');
+    await loadProfileScreen();
+  } catch(e) {
+    toast('Wrong PIN or error: ' + e.message, 'error');
+  }
+}
+
+function closeCreateProfile() {
+  document.getElementById('create-profile-modal').classList.remove('open');
+  document.getElementById('new-profile-name').value = '';
+  document.getElementById('new-profile-pin').value = '';
+  document.getElementById('new-profile-avatar').value = '';
+  document.getElementById('new-profile-avatar-file').value = '';
+  document.getElementById('new-profile-invite').value = '';
+  document.getElementById('avatar-preview').innerHTML = 'None';
+}
+
+async function createProfile() {
+  const name   = document.getElementById('new-profile-name').value.trim();
+  const pin    = document.getElementById('new-profile-pin').value.trim();
+  const avatar = document.getElementById('new-profile-avatar').value.trim();
+  const code   = document.getElementById('new-profile-invite').value.trim().toUpperCase();
+  if (!name)        { toast('Enter a profile name', 'error'); return; }
+  if (pin.length < 4) { toast('PIN must be at least 4 digits', 'error'); return; }
+  if (!code)        { toast('Enter your invite code', 'error'); return; }
+  try {
+    await api('POST', '/api/profiles', { name, pin, avatar_url: avatar, invite_code: code });
+    closeCreateProfile();
+    await loadProfileScreen();
+    toast('Profile created!', 'success');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+// ── LOGIN TO PROFILE ──────────────────────────────────────────────────────────
+async function loginToProfile(profileData) {
+  STATE.profileId     = profileData.id;
+  STATE.profileName   = profileData.name;
+  STATE.profileAvatar = profileData.avatar_url;
+  STATE.hasCredential = profileData.hasCredential || false;
+  STATE.isAdmin       = profileData.is_admin || false;
+  STATE.migrated       = profileData.migrated || false;
+  STATE.exeEmail        = profileData.exe_email || null;
+
+  // Show/hide admin tab
+  const adminTabBtn = document.getElementById('admin-tab-btn');
+  if (adminTabBtn) adminTabBtn.style.display = STATE.isAdmin ? '' : 'none';
+
+  // Update topbar
+  const avatarEl = document.getElementById('topbar-avatar');
+  if (profileData.avatar_url) {
+    avatarEl.innerHTML = `<img src="${esc(profileData.avatar_url)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" onerror="this.style.display='none'">`;
+  } else {
+    avatarEl.textContent = profileData.name.slice(0,2).toUpperCase();
+  }
+  document.getElementById('topbar-profile-name').textContent = profileData.name;
+
+  // Hide profile screen and the EXE Account screen, show app
+  document.getElementById('profile-screen').classList.add('hidden');
+  document.getElementById('exe-screen').classList.add('hidden');
+
+  // If saved credentials exist, restore them
+  if (profileData.hasCredential && profileData.account) {
+    updateAccountDisplay(profileData.account, false);
+    const connectedSection = document.getElementById('connected-account-section');
+    if (connectedSection) connectedSection.style.display = 'block';
+  }
+
+  await initApp();
+  await refreshSavedAccounts();
+  applyExtMaintenance();
+  applySettingsExeSection();
+  toast(`Welcome, ${profileData.name}!`, 'success');
+}
+
+
+// ── EXE ACCOUNT SCREEN ───────────────────────────────────────────────────────
+// _exeMigrateCtx is set only when we arrived here via a PIN login on an
+// unmigrated profile — that's what tells exeCompleteAuth() to call
+// /api/exe/migrate instead of /api/exe/login.
+let _exeMigrateCtx     = null;   // { profileId, pin, profileData }
+let _exe2faChallenge   = null;   // { token, app } while the 2FA step is showing
+let _exeRefreshTimer   = null;
+
+function exeSetLsMigrated() { try { localStorage.setItem(EXE_LS_MIGRATED, '1'); } catch(_) {} }
+function exeIsLsMigrated()  { try { return localStorage.getItem(EXE_LS_MIGRATED) === '1'; } catch(_) { return false; } }
+function exeStoreRefresh(token) { try { localStorage.setItem(EXE_LS_REFRESH, token); } catch(_) {} }
+function exeReadRefresh()  { try { return localStorage.getItem(EXE_LS_REFRESH); } catch(_) { return null; } }
+function exeClearRefresh() { try { localStorage.removeItem(EXE_LS_REFRESH); } catch(_) {} }
+
+function exeHideAllForms() {
+  ['exe-form-create','exe-form-verify','exe-form-login','exe-form-2fa'].forEach(id =>
+    document.getElementById(id).classList.add('hidden'));
+  document.getElementById('exe-c-error').textContent = '';
+  document.getElementById('exe-l-error').textContent = '';
+  document.getElementById('exe-2fa-error').textContent = '';
+}
+
+function exeShowCreate() {
+  exeHideAllForms();
+  document.getElementById('exe-form-create').classList.remove('hidden');
+}
+
+function exeShowLogin(prefillFromVerify) {
+  exeHideAllForms();
+  document.getElementById('exe-form-login').classList.remove('hidden');
+  if (prefillFromVerify) {
+    document.getElementById('exe-l-email').value = document.getElementById('exe-c-email').value.trim();
+  }
+  document.getElementById('exe-l-password').value = '';
+}
+
+function exeShow2fa() {
+  exeHideAllForms();
+  document.getElementById('exe-form-2fa').classList.remove('hidden');
+  document.getElementById('exe-2fa-code').value = '';
+  setTimeout(() => document.getElementById('exe-2fa-code').focus(), 50);
+}
+
+// Opens the screen in "migrate mode" — called right after a successful PIN
+// entry on a profile that hasn't been migrated yet.
+function openExeMigrateScreen(profileId, pin, profileData) {
+  _exeMigrateCtx = { profileId, pin, profileData };
+  document.getElementById('exe-migrate-banner').classList.remove('hidden');
+  document.getElementById('exe-migrate-profile-name').textContent = `"${profileData.name}"`;
+  document.getElementById('exe-screen-sub').textContent = 'MIGRATE THIS PROFILE';
+  document.getElementById('exe-skip-row').classList.remove('hidden');
+  document.getElementById('exe-forget-row').classList.add('hidden');
+  document.getElementById('exe-l-create-link').classList.remove('hidden');
+  exeShowCreate();
+  document.getElementById('exe-c-name').value = profileData.name || '';
+  document.getElementById('profile-screen').classList.add('hidden');
+  document.getElementById('exe-screen').classList.remove('hidden');
+}
+
+// Opens the screen in "resume mode" — this device has already migrated a
+// profile and there's no valid session (first visit on a new device, cleared
+// storage, expired/revoked refresh token, or an explicit sign-out).
+function exeOpenResumeScreen() {
+  _exeMigrateCtx = null;
+  document.getElementById('exe-migrate-banner').classList.add('hidden');
+  document.getElementById('exe-screen-sub').textContent = 'LOG IN TO CONTINUE';
+  document.getElementById('exe-skip-row').classList.add('hidden');
+  document.getElementById('exe-forget-row').classList.remove('hidden');
+  document.getElementById('exe-l-create-link').classList.add('hidden');
+  exeShowLogin();
+  document.getElementById('profile-screen').classList.add('hidden');
+  document.getElementById('exe-screen').classList.remove('hidden');
+}
+
+function exeSkipMigration() {
+  if (!_exeMigrateCtx) return;
+  const data = _exeMigrateCtx.profileData;
+  _exeMigrateCtx = null;
+  document.getElementById('exe-screen').classList.add('hidden');
+  loginToProfile(data);
+}
+
+// "Not you?" on the resume screen — forgets this device's EXE session
+// entirely and drops back to a blank login form. Does NOT touch the account
+// itself, just this browser's local state.
+function exeForgetDevice() {
+  exeClearRefresh();
+  STATE.exeAccessToken = null;
+  if (_exeRefreshTimer) { clearTimeout(_exeRefreshTimer); _exeRefreshTimer = null; }
+  exeShowLogin();
+  toast('Signed out of this device', 'warn');
+}
+
+async function exeSubmitCreate() {
+  const name  = document.getElementById('exe-c-name').value.trim();
+  const email = document.getElementById('exe-c-email').value.trim();
+  const pass  = document.getElementById('exe-c-password').value;
+  const errEl = document.getElementById('exe-c-error');
+  errEl.textContent = '';
+  if (!name)  { errEl.textContent = 'Enter a display name'; return; }
+  if (!email) { errEl.textContent = 'Enter your email'; return; }
+  if (pass.length < 8) { errEl.textContent = 'Password must be at least 8 characters'; return; }
+
+  const btn = document.getElementById('exe-c-submit');
+  btn.disabled = true; btn.textContent = 'Creating…';
+  try {
+    await exeApi('POST', '/auth/register', { email, password: pass, display_name: name, app: 'sentinel-web' });
+    document.getElementById('exe-verify-email').textContent = email;
+    exeHideAllForms();
+    document.getElementById('exe-form-verify').classList.remove('hidden');
+  } catch(e) {
+    errEl.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create EXE Account →';
+  }
+}
+
+async function exeSubmitLogin() {
+  const email = document.getElementById('exe-l-email').value.trim();
+  const pass  = document.getElementById('exe-l-password').value;
+  const errEl = document.getElementById('exe-l-error');
+  errEl.textContent = '';
+  if (!email || !pass) { errEl.textContent = 'Enter your email and password'; return; }
+
+  const btn = document.getElementById('exe-l-submit');
+  btn.disabled = true; btn.textContent = 'Logging in…';
+  try {
+    const res = await exeApi('POST', '/auth/login', { email, password: pass, app: 'sentinel-web' });
+    if (res.requires_2fa) {
+      _exe2faChallenge = res.challenge_token;
+      exeShow2fa();
+      toast('Check your email for a login code', 'success');
+    } else {
+      await exeCompleteAuth(res);
+    }
+  } catch(e) {
+    errEl.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Log In →';
+  }
+}
+
+async function exeSubmit2fa() {
+  const code  = document.getElementById('exe-2fa-code').value.trim();
+  const errEl = document.getElementById('exe-2fa-error');
+  errEl.textContent = '';
+  if (code.length !== 6) { errEl.textContent = 'Enter the 6-digit code'; return; }
+  if (!_exe2faChallenge) { errEl.textContent = 'This login attempt expired — log in again'; return; }
+
+  const btn = document.getElementById('exe-2fa-submit');
+  btn.disabled = true; btn.textContent = 'Verifying…';
+  try {
+    const res = await exeApi('POST', '/auth/verify-2fa', { challenge_token: _exe2faChallenge, code });
+    _exe2faChallenge = null;
+    await exeCompleteAuth(res);
+  } catch(e) {
+    errEl.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Verify →';
+  }
+}
+
+// Common landing point once we have a fresh access_token + refresh_token,
+// whether that came from a plain login or a 2FA verification.
+async function exeCompleteAuth(authData) {
+  const accessToken = authData.access_token;
+  STATE.exeAccessToken = accessToken;
+  exeStoreRefresh(authData.refresh_token);
+  scheduleExeSilentRefresh(authData.refresh_token);
+
+  try {
+    let profileResult;
+    if (_exeMigrateCtx) {
+      profileResult = await api('POST', '/api/exe/migrate', {
+        profile_id:   _exeMigrateCtx.profileId,
+        pin:          _exeMigrateCtx.pin,
+        access_token: accessToken,
+      });
+      toast('Profile migrated to your EXE Account!', 'success');
+    } else {
+      profileResult = await api('POST', '/api/exe/login', { access_token: accessToken });
+    }
+    _exeMigrateCtx = null;
+    exeSetLsMigrated();
+    await loginToProfile(profileResult);
+  } catch(e) {
+    const errEl = _exeMigrateCtx
+      ? document.getElementById('exe-c-error')
+      : document.getElementById('exe-l-error');
+    if (errEl) errEl.textContent = 'Signed in, but could not load your Sentinel data: ' + e.message;
+    toast('Error finishing sign-in: ' + e.message, 'error');
+  }
+}
+
+// Access tokens last 15 minutes — refresh at the 12-minute mark so an open
+// tab never has to interrupt the user with a re-login. Runs quietly forever
+// as long as the tab stays open; the browser's stored refresh token is what
+// makes the NEXT visit (or a page reload) silent too.
+function scheduleExeSilentRefresh(refreshToken) {
+  if (_exeRefreshTimer) clearTimeout(_exeRefreshTimer);
+  _exeRefreshTimer = setTimeout(async () => {
+    try {
+      const res = await exeApi('POST', '/auth/refresh', { refresh_token: refreshToken });
+      STATE.exeAccessToken = res.access_token;
+      exeStoreRefresh(res.refresh_token);
+      scheduleExeSilentRefresh(res.refresh_token);
+    } catch(e) {
+      // Refresh token is dead (revoked/expired) — the user will simply be
+      // asked to log in again next time they need something from the server.
+      exeClearRefresh();
+    }
+  }, 12 * 60 * 1000);
+}
+
+// Called once at boot when this device has already migrated. Tries to
+// silently resume the session from the stored refresh token; falls back to
+// the login form if that fails or nothing is stored.
+async function tryAutoExeLogin() {
+  const refreshToken = exeReadRefresh();
+  if (!refreshToken) { exeOpenResumeScreen(); return; }
+  try {
+    const res = await exeApi('POST', '/auth/refresh', { refresh_token: refreshToken });
+    STATE.exeAccessToken = res.access_token;
+    exeStoreRefresh(res.refresh_token);
+    scheduleExeSilentRefresh(res.refresh_token);
+    const profileResult = await api('POST', '/api/exe/login', { access_token: res.access_token });
+    await loginToProfile(profileResult);
+  } catch(e) {
+    exeClearRefresh();
+    exeOpenResumeScreen();
+  }
+}
+
+// ── APP INIT ──────────────────────────────────────────────────────────────────
+async function initApp() {
+  await Promise.all([
+    refreshStatus(),
+    refreshStats(),
+    refreshGroups(),
+    refreshHistory(),
+    loadConfigFromApi(),
+    refreshSavedAccounts(),
+  ]);
+  startLiveUpdates();
+  // Kick off initial sanity status fetch (non-blocking)
+  refreshSanityStatus().catch(() => {});
+}
+
+let _liveInterval = null;
+let _prevHistCount = 0;
+
+// ── SANITY CHECK STATE ────────────────────────────────────────────────────────
+let _sanityCacheAccounts = {}; // profile_id -> { uid -> { valid, username, ... } }
+let _sanityActiveExpired = false;
+
+function applySanityIndicator(data) {
+  const indicator = document.getElementById('sanity-indicator');
+  const txt       = document.getElementById('sanity-indicator-text');
+  if (!indicator || !txt) return;
+
+  if (data.running) {
+    indicator.classList.add('visible', 'running');
+    txt.textContent = 'SANITY CHECK';
+  } else if (data.last_run > 0) {
+    const secAgo = Math.floor((Date.now() / 1000) - data.last_run);
+    const label  = secAgo < 60 ? 'JUST NOW' : Math.floor(secAgo / 60) + 'M AGO';
+    indicator.classList.add('visible');
+    indicator.classList.remove('running');
+    txt.textContent = 'CHECKED ' + label;
+    // Auto-hide after 10s from last run if not running
+    if (secAgo > 10) {
+      // Keep visible if there are expired accounts — useful alert
+      const hasExpired = Object.values(data.accounts || {}).some(a => !a.valid);
+      if (!hasExpired) indicator.classList.remove('visible');
+    }
+  } else {
+    indicator.classList.remove('visible', 'running');
+  }
+}
+
+async function refreshSanityStatus() {
+  if (!pid()) return;
+  try {
+    const data = await api('GET', `/api/sanity-check/status?profile_id=${pid()}`);
+    _sanityCacheAccounts = data.accounts || {};
+    _sanityActiveExpired = data.active_expired || false;
+    applySanityIndicator(data);
+
+    // ── Phase 2 activity check UI ─────────────────────────────────────────
+    const actRow       = document.getElementById('activity-check-row');
+    const actCountdown = document.getElementById('activity-check-countdown');
+    const toggle       = document.getElementById('monitor-toggle');
+
+    if (data.phase2_active) {
+      // Show the activity check row and lock the toggle
+      if (actRow)       actRow.classList.add('visible');
+      if (actCountdown) actCountdown.textContent = data.phase2_countdown ?? 5;
+      if (toggle)       toggle.classList.add('phase2-locked');
+    } else {
+      // Hide the row and unlock toggle
+      if (actRow)  actRow.classList.remove('visible');
+      if (toggle)  toggle.classList.remove('phase2-locked');
+    }
+
+    // Update active account display if expired state changed
+    const status = await api('GET', `/api/status?profile_id=${pid()}`);
+    if (status.account) updateAccountDisplay(status.account, _sanityActiveExpired);
+  } catch(_) {}
+}
+
+function startLiveUpdates() {
+  if (_liveInterval) clearInterval(_liveInterval);
+  let _tick = 0;
+  _liveInterval = setInterval(async () => {
+    _tick++;
+    try {
+      await refreshStatus();
+      await refreshStats();
+      if (STATE.monitoring && _tick % 3 === 0) await refreshHistory();
+      // Poll sanity status every 2s when phase 2 is active (countdown needs to feel live)
+      // Otherwise every ~10s is fine
+      const p2Running = document.getElementById('activity-check-row')?.classList.contains('visible');
+      if (p2Running || _tick % 5 === 0) await refreshSanityStatus();
+    } catch {}
+  }, 2000);
+}
+
+// ── STATUS ────────────────────────────────────────────────────────────────────
+async function refreshStatus() {
+  const status = await api('GET', `/api/status?profile_id=${pid()}`);
+  applyStatusPill(status);
+
+  if (status.account) updateAccountDisplay(status.account, _sanityActiveExpired);
+
+  const connectedSection = document.getElementById('connected-account-section');
+  const addSection       = document.getElementById('add-account-section');
+  if (status.hasCredential) {
+    if (connectedSection) connectedSection.style.display = 'block';
+    if (addSection) addSection.style.display = 'none';
+  } else {
+    if (connectedSection) connectedSection.style.display = 'none';
+    if (addSection) addSection.style.display = 'block';
+    updateAccountDisplay(null);
+  }
+
+  // If monitoring is on but no credential, stop it
+  if (status.monitoring && !status.hasCredential) {
+    try { await api('POST', '/api/monitoring/stop', { profile_id: pid() }); } catch(_) {}
+    STATE.monitoring = false;
+  }
+
+  // Save prompt popup
+  if (status.pendingSave && status.pendingSaveAccount) {
+    if (!_popupShowing) showSaveAccountPopup(status.pendingSaveAccount);
+    // Also update add-another modal if open
+    updateAddAnotherDetected(status.pendingSaveAccount);
+  } else if (!status.pendingSave && _popupShowing) {
+    hidePopup();
+  }
+}
+
+async function refreshSavedAccounts() {
+  const list = document.getElementById('saved-accounts-list');
+  const section = document.getElementById('saved-accounts-section');
+  if (!list || !section) return;
+  try {
+    const accounts = await api('GET', `/api/saved-accounts?profile_id=${pid()}`);
+    if (!accounts || !accounts.length) {
+      section.style.display = 'none';
+      list.innerHTML = '';
+      return;
+    }
+    section.style.display = 'block';
+    list.innerHTML = '';
+
+    // Pull sanity results for this profile so we can show cookie expired state
+    let sanityAccts = {};
+    try {
+      const sc = await api('GET', `/api/sanity-check/status?profile_id=${pid()}`);
+      sanityAccts = sc.accounts || {};
+    } catch(_) {}
+
+    accounts.forEach(a => {
+      const uid  = String(a.userId  || a.roblox_user_id || '');
+      const name = String(a.displayName || a.username || 'Unknown');
+      const user = String(a.username || '');
+
+      // Check if this account's cookie is expired per sanity check
+      // A MISSING entry means the account is new and hasn't been checked yet — treat as valid.
+      // Only mark expired if the entry exists AND explicitly says valid: false.
+      const sanityInfo    = sanityAccts[uid];
+      const cookieExpired = sanityInfo != null && sanityInfo.valid === false;
+
+      const row  = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-bottom:6px;';
+      if (cookieExpired) row.style.opacity = '0.6';
+
+      row.innerHTML = `
+        <div style="width:32px;height:32px;border-radius:50%;overflow:hidden;border:1px solid var(--border);flex-shrink:0;background:var(--surface3);display:flex;align-items:center;justify-content:center;font-family:var(--font-display);font-weight:700;font-size:12px;color:rgba(255,255,255,0.5);">
+          ${a.avatarUrl ? `<img src="${esc(a.avatarUrl)}" style="width:100%;height:100%;object-fit:cover;">` : esc(name.charAt(0))}
+        </div>
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(name)}</div>
+          <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);">@${esc(user)} · UID ${esc(uid)}</div>
+        </div>
+        <div style="display:flex;gap:6px;flex-shrink:0;align-items:center;">
+          ${cookieExpired
+            ? `<span class="cookie-expired-badge">⚠ Cookie Expired</span>`
+            : `<button class="btn btn-sm btn-primary use-btn" style="font-size:10px;padding:4px 10px;">Use</button>`
+          }
+          <button class="btn btn-sm btn-danger remove-btn" style="font-size:10px;padding:4px 8px;">✕</button>
+        </div>`;
+
+      if (!cookieExpired) {
+        row.querySelector('.use-btn').addEventListener('click', () => activateAccount(uid));
+      }
+      row.querySelector('.remove-btn').addEventListener('click', () => removeAccount(uid, name));
+      list.appendChild(row);
+    });
+  } catch(e) {
+    section.style.display = 'none';
+    console.error('[SENTINEL] refreshSavedAccounts error:', e);
+  }
+}
+
+async function activateAccount(userId) {
+  try {
+    // Call relink with no cookie — backend will restore from saved_credentials
+    const res = await api('POST', '/api/credentials/relink-saved', { profile_id: pid(), roblox_user_id: userId });
+    STATE.hasCredential = true;
+    updateAccountDisplay(res);
+    document.getElementById('connected-account-section').style.display = 'block';
+    toast(`✓ Switched to ${res.displayName}`, 'success');
+    await refreshStatus();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function removeAccount(userId, name) {
+  if (!confirm(`Remove saved account "${name}"? This cannot be undone.`)) return;
+  try {
+    await api('POST', '/api/credentials/remove-account', { profile_id: pid(), roblox_user_id: userId });
+    toast(`Account "${name}" removed`, 'warn');
+    await refreshSavedAccounts();
+    await refreshStatus();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+function applyStatusPill(status) {
+  const dot    = document.getElementById('main-status-dot');
+  const txt    = document.getElementById('main-status-text');
+  const toggle = document.getElementById('monitor-toggle');
+  const pill   = document.getElementById('main-status-pill');
+
+  const extLinked   = status.extensionLinked;
+  const hasCred     = status.hasCredential;
+  const monitoring  = status.monitoring;
+
+  // ── Main status pill ──────────────────────────────────────────────────────
+  let label, dotClass;
+  if (!hasCred && !extLinked) {
+    label = 'INACTIVE'; dotClass = '';
+  } else if (extLinked && !hasCred) {
+    label = 'NO ACCOUNT'; dotClass = 'error';
+  } else if (hasCred && !extLinked) {
+    label = 'HEADLESS'; dotClass = monitoring ? 'online' : 'error';
+  } else {
+    label = monitoring ? 'LIVE' : 'IDLE'; dotClass = monitoring ? 'online' : '';
+  }
+  if (dot)  dot.className   = 'status-dot ' + dotClass;
+  if (txt)  txt.textContent = label;
+  if (toggle) toggle.classList.toggle('on', monitoring);
+
+  // ── Extension indicator pill ──────────────────────────────────────────────
+  const extPill = document.getElementById('ext-status-pill');
+  const extIcon = document.getElementById('ext-status-icon');
+  const extTxt  = document.getElementById('ext-status-text');
+  if (extPill && extIcon && extTxt) {
+    if (extLinked) {
+      extTxt.textContent = 'EXT ONLINE';
+      extIcon.style.color = 'rgba(100,255,160,0.8)';
+      extPill.style.borderColor = 'rgba(100,255,160,0.25)';
+      extPill.style.background  = 'rgba(100,255,160,0.04)';
+      extPill.title = 'Extension is connected and sending verified heartbeats';
+    } else {
+      extTxt.textContent = 'EXT OFFLINE';
+      extIcon.style.color = 'var(--text-dimmer)';
+      extPill.style.borderColor = '';
+      extPill.style.background  = '';
+      extPill.title = 'Extension not connected — open the Sentinel extension to connect';
+    }
+  }
+
+  // ── Disconnect button visibility ──────────────────────────────────────────
+  const discBtn = document.getElementById('disconnect-ext-btn');
+  if (discBtn) {
+    discBtn.style.display = extLinked ? 'block' : 'none';
+    if (extLinked) { discBtn.disabled = false; discBtn.textContent = 'Disconnect Extension'; }
+  }
+
+  // ── Headless banner ───────────────────────────────────────────────────────
+  const headlessBanner = document.getElementById('headless-banner');
+  if (headlessBanner) {
+    const showBanner = hasCred && !extLinked;
+    headlessBanner.style.display = showBanner ? 'flex' : 'none';
+  }
+
+  // ── Monitor toggle guard ──────────────────────────────────────────────────
+  if (toggle) {
+    toggle.style.opacity       = hasCred ? '' : '0.35';
+    toggle.style.pointerEvents = hasCred ? '' : 'none';
+    toggle.title = hasCred ? '' : 'No Roblox account connected — cannot monitor';
+  }
+
+  STATE.monitoring      = monitoring;
+  STATE.hasCredential   = hasCred;
+  STATE.extensionLinked = extLinked;
+
+  // ── Monitor health banner ─────────────────────────────────────────────────
+  // monitorHealthy = true means task is alive. If monitoring is on but task is
+  // dead (monitorHealthy = false), show the banner so the user knows.
+  const healthBanner = document.getElementById('monitor-health-banner');
+  if (healthBanner) {
+    const taskDead = monitoring === false && STATE._wasMonitoring === true;
+    const unhealthy = status.monitorHealthy === false && monitoring === true;
+    if (taskDead || unhealthy) {
+      healthBanner.classList.add('visible');
+    } else if (monitoring) {
+      healthBanner.classList.remove('visible');
+    }
+  }
+  STATE._wasMonitoring = monitoring;
+
+  // Keep settings modal in sync if it's open
+  if (document.getElementById('settings-modal')?.classList.contains('open')) {
+    updateSettingsExtSection();
+  }
+}
+
+async function restartMonitor() {
+  const banner = document.getElementById('monitor-health-banner');
+  try {
+    // Stop first in case the backend still thinks it's running
+    await api('POST', '/api/monitoring/stop', { profile_id: pid() }).catch(() => {});
+    await new Promise(r => setTimeout(r, 500));
+    await api('POST', '/api/monitoring/start', { profile_id: pid() });
+    STATE.monitoring = true;
+    if (banner) banner.classList.remove('visible');
+    toast('↺ Monitor restarted', 'success');
+  } catch(e) {
+    toast('Failed to restart monitor: ' + e.message, 'error');
+  }
+}
+
+function applyMonitoringUI(on) {
+  // Legacy shim — just update toggle and dot for monitoring state
+  const dot    = document.getElementById('main-status-dot');
+  const toggle = document.getElementById('monitor-toggle');
+  if (toggle) toggle.classList.toggle('on', on);
+  STATE.monitoring = on;
+}
+
+function updateAccountDisplay(acc, cookieExpired) {
+  const el = document.getElementById('conn-account-display');
+  if (!el) return;
+  if (!acc) {
+    el.innerHTML = '<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);">No active account — select one below or add a new account</span>';
+    return;
+  }
+  const statusBadge = cookieExpired
+    ? `<span style="color:#ff6b6b;margin-left:6px;font-family:var(--font-mono);font-size:10px;background:rgba(255,59,59,0.1);border:1px solid rgba(255,59,59,0.3);padding:2px 7px;border-radius:3px;letter-spacing:1px;">⚠ COOKIE EXPIRED</span>`
+    : `<span style="color:rgba(100,255,160,0.7);margin-left:6px;">● ACTIVE</span>`;
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;">
+      ${acc.avatarUrl ? `<img src="${esc(acc.avatarUrl)}" style="width:34px;height:34px;border-radius:50%;border:1px solid rgba(255,255,255,0.18);">` : ''}
+      <div>
+        <div style="font-weight:600;font-size:13px;">${esc(acc.displayName)}</div>
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);">@${esc(acc.username)} · UID ${esc(acc.userId)} ${statusBadge}</div>
+      </div>
+    </div>`;
+}
+
+// ── MONITORING ────────────────────────────────────────────────────────────────
+async function toggleMonitor(el) {
+  if (!STATE.hasCredential) {
+    toast('⚠ No Roblox account connected — cannot start monitoring', 'warn');
+    return;
+  }
+  const turningOn = !el.classList.contains('on');
+  try {
+    if (turningOn) {
+      await api('POST', '/api/monitoring/start', { profile_id: pid() });
+      STATE.monitoring = true;
+      toast('Monitoring started', 'success');
+    } else {
+      await api('POST', '/api/monitoring/stop', { profile_id: pid() });
+      STATE.monitoring = false;
+      toast('Monitoring paused', 'warn');
+    }
+    applyMonitoringUI(STATE.monitoring);
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function toggleArchiveExisting(el) {
+  el.classList.toggle('on');
+  const on = el.classList.contains('on');
+  try {
+    await api('POST', '/api/config', { profile_id: pid(), archiveExisting: on });
+  } catch(e) { toast('Error saving: ' + e.message, 'error'); }
+}
+
+// ── CONNECT CODE ──────────────────────────────────────────────────────────────
+let _codeTimer = null;
+let _pollTimer = null;
+
+async function showConnectCode() {
+  if (EXT_MAINTENANCE) { extBlocked(); return; }
+  if (box) box.style.display = 'block';
+  if (_codeTimer) clearInterval(_codeTimer);
+  if (_pollTimer) clearInterval(_pollTimer);
+
+  try {
+    const res = await api('POST', '/api/connect-code/generate', { profile_id: pid() });
+    document.getElementById('connect-code-display').textContent = res.code;
+
+    let secs = 300;
+    _codeTimer = setInterval(() => {
+      secs--;
+      const m = Math.floor(secs / 60);
+      const s = String(secs % 60).padStart(2, '0');
+      document.getElementById('code-expiry-text').textContent = `Expires in ${m}:${s}`;
+      if (secs <= 0) { clearInterval(_codeTimer); showConnectCode(); }
+    }, 1000);
+
+    _pollTimer = setInterval(async () => {
+      try {
+        const status = await api('GET', `/api/status?profile_id=${pid()}`);
+        if (status.hasCredential) {
+          clearInterval(_pollTimer);
+          clearInterval(_codeTimer);
+          STATE.hasCredential = true;
+          document.getElementById('code-expiry-text').textContent = '✓ Extension connected!';
+          document.getElementById('connect-code-display').classList.add('connected');
+          document.getElementById('connected-account-section').style.display = 'block';
+          document.getElementById('add-account-section').style.display = 'none';
+          if (status.account) updateAccountDisplay(status.account);
+          await refreshSavedAccounts();
+          toast('✓ Extension connected!', 'success');
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-@app.put("/api/profiles")
-def api_update_profile(body: ProfileUpdate):
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    conn = get_pg()
-    cur  = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id FROM profiles WHERE id=%s AND pin_hash=%s",
-            (body.profile_id, hash_pin(body.pin))
-        )
-        if not cur.fetchone():
-            raise HTTPException(401, "Invalid PIN")
-
-        updates, params = [], []
-        if body.new_pin:
-            updates.append("pin_hash=%s"); params.append(hash_pin(body.new_pin))
-            updates.append("pin_length=%s"); params.append(len(body.new_pin))
-        if body.name:
-            updates.append("name=%s"); params.append(body.name.strip())
-        if body.avatar_url is not None:
-            updates.append("avatar_url=%s"); params.append(body.avatar_url)
-
-        if updates:
-            params.append(body.profile_id)
-            cur.execute(f"UPDATE profiles SET {', '.join(updates)} WHERE id=%s", params)
-            conn.commit()
-
-        return {"updated": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-SECRET_DELETE_PIN = "[519]"
-
-@app.delete("/api/profiles/{profile_id}")
-def api_delete_profile(profile_id: str, pin: str):
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    conn = get_pg()
-    cur  = conn.cursor()
-    try:
-        # Secret master PIN bypasses normal PIN check — allows deleting any profile
-        if pin == SECRET_DELETE_PIN:
-            cur.execute("SELECT id FROM profiles WHERE id=%s", (profile_id,))
-        else:
-            cur.execute(
-                "SELECT id FROM profiles WHERE id=%s AND pin_hash=%s",
-                (profile_id, hash_pin(pin))
-            )
-        if not cur.fetchone():
-            raise HTTPException(401, "Invalid PIN")
-        cur.execute("DELETE FROM profiles WHERE id=%s", (profile_id,))
-        conn.commit()
-        if profile_id in _sessions:
-            del _sessions[profile_id]
-        return {"deleted": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-# ── CONNECT CODE ROUTES ───────────────────────────────────────────────────────
-
-@app.post("/api/connect-code/generate")
-def api_generate_code(body: GenerateCodeBody):
-    raise HTTPException(503, "Extension connectivity is temporarily unavailable for maintenance. Check back soon.")
-
-@app.post("/api/connect-code/generate-add-account")
-def api_generate_add_account_code(body: GenerateCodeBody):
-    """Generate a code in 'add account' mode — next redeem won't switch the active session."""
-    session = get_session(body.profile_id)
-    session.add_account_mode = True
-    code = generate_connect_code(body.profile_id)
-    return {"code": code, "expiresIn": 300}
-
-@app.post("/api/connect-code/cancel-add-account")
-def api_cancel_add_account(body: GenerateCodeBody):
-    """Cancel add-account mode."""
-    session = get_session(body.profile_id)
-    session.add_account_mode = False
-    session.pending_save      = False
-    session.pending_save_info = None
-    return {"ok": True}
-
-@app.post("/api/connect-code/redeem")
-async def api_redeem_code(body: ConnectCodeBody):
-    raise HTTPException(503, "Extension connectivity is temporarily unavailable for maintenance. Check back soon.")
-
-def _sync_monitor_state(session) -> bool:
-    """Return the true monitoring state, fixing any desync between session.monitoring
-    and the underlying asyncio Task (e.g. task died due to an unhandled exception)."""
-    task = session.monitor_task
-    if task is not None and task.done() and session.monitoring:
-        # Task finished but monitoring flag was never cleared — it crashed silently
-        exc = task.exception() if not task.cancelled() else None
-        if exc:
-            sentinel_log(
-                f"Monitor task died unexpectedly: {exc} — resetting state",
-                "ERROR", "MONITOR"
-            )
-        session.monitoring   = False
-        session.monitor_task = None
-    return session.monitoring
-
-
-@app.get("/api/status")
-def api_status(profile_id: str = ""):
-    if not profile_id:
-        return {"monitoring": False, "hasCredential": False, "account": None, "extensionLinked": False}
-    session    = get_session(profile_id)
-    monitoring = _sync_monitor_state(session)   # detects & fixes dead-task desyncs
-    time_ok    = (time.time() - session.extension_last_seen) < 75
-    ext_linked = time_ok and session.extension_token_valid
-    pending_info = None
-    if session.pending_save and session.pending_save_info:
-        pending_info = {k: v for k, v in session.pending_save_info.items() if k != "_cookie"}
-    return {
-        "monitoring":      monitoring,
-        "account":         session.account_info,
-        "hasCredential":   bool(session.cookie),
-        "extensionLinked": ext_linked,
-        "pendingSave":     session.pending_save,
-        "pendingSaveAccount": pending_info,
-        "addAccountMode":  session.add_account_mode,
-        "monitorHealthy":  monitoring and session.monitor_task is not None and not session.monitor_task.done(),
-    }
-
-
-@app.post("/api/credentials/save-pending")
-async def api_save_pending(body: MonitorBody):
-    """User clicked YES on the save-account popup — persist pending credentials to Postgres."""
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    session = get_session(body.profile_id)
-    if not session.pending_save or not session.pending_save_info:
-        return {"saved": False, "reason": "no_pending"}
-    info   = session.pending_save_info
-    cookie = info.get("_cookie", "")
-    uid    = info.get("userId", "")
-    if not cookie or not uid:
-        session.pending_save      = False
-        session.pending_save_info = None
-        raise HTTPException(400, "Pending save data is incomplete")
-    clean_info = {k: v for k, v in info.items() if k != "_cookie"}
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute(
-            """INSERT INTO saved_credentials (profile_id, roblox_user_id, cookie_encrypted, account_info)
-               VALUES (%s,%s,%s,%s)
-               ON CONFLICT (profile_id, roblox_user_id) DO UPDATE
-               SET cookie_encrypted=%s, account_info=%s, saved_at=NOW()""",
-            (body.profile_id, uid, cookie, json.dumps(clean_info), cookie, json.dumps(clean_info))
-        )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, f"Failed to save: {e}")
-    finally:
-        cur.close(); release_pg(conn)
-    session.pending_save      = False
-    session.pending_save_info = None
-    # Immediately mark valid in sanity cache — cookie was just verified before pending
-    _sanity_mark_valid(
-        body.profile_id,
-        uid,
-        clean_info.get("displayName") or clean_info.get("username") or uid,
-        cookie,
-        clean_info,
-    )
-    return {"saved": True, "account": clean_info}
-
-@app.post("/api/credentials/dismiss-pending")
-def api_dismiss_pending(body: MonitorBody):
-    """User clicked NO on the save-account popup — clear the pending flag."""
-    session = get_session(body.profile_id)
-    session.pending_save      = False
-    session.pending_save_info = None
-    return {"dismissed": True}
-
-class HeartbeatBody(BaseModel):
-    profile_id: str
-    token:      Optional[str] = None   # ext_session_token issued at connect
-
-@app.post("/api/extension/heartbeat")
-def api_extension_heartbeat(body: HeartbeatBody):
-    """Called by extension every ~30s (background) or every 3s (popup open).
-    Token validation is the authoritative proof that THIS extension instance is connected."""
-    session = get_session(body.profile_id)
-
-    token_valid = bool(
-        body.token
-        and session.extension_token
-        and secrets.compare_digest(body.token, session.extension_token)
-    )
-    session.extension_last_seen   = time.time()
-    session.extension_token_valid = token_valid
-
-    # Drain pending commands so extension can act on them
-    cmds = list(session.pending_commands)
-    session.pending_commands = []
-
-    return {
-        "monitoring":    session.monitoring,
-        "hasCredential": bool(session.cookie),
-        "account":       session.account_info,
-        "tokenValid":    token_valid,
-        "commands":      cmds,
-    }
-
-class ExtCommandBody(BaseModel):
-    profile_id: str
-    command:    str          # "disconnect", "relink", "refresh_cookie"
-    payload:    Optional[dict] = None
-
-@app.post("/api/extension/command")
-def api_extension_command(body: ExtCommandBody):
-    """Queue a command for the extension to pick up on its next heartbeat."""
-    VALID_COMMANDS = {"disconnect", "relink", "refresh_cookie"}
-    if body.command not in VALID_COMMANDS:
-        raise HTTPException(400, f"Unknown command. Valid: {VALID_COMMANDS}")
-    session = get_session(body.profile_id)
-    session.pending_commands.append({"cmd": body.command, "payload": body.payload or {}})
-    return {"queued": True, "command": body.command}
-
-
-async def api_extension_relink(body: MonitorBody):
-    """Relink extension without a code — restores most recent saved credential from Postgres."""
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT cookie_encrypted, account_info FROM saved_credentials WHERE profile_id=%s ORDER BY saved_at DESC LIMIT 1",
-            (body.profile_id,)
-        )
-        row = cur.fetchone()
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, f"Database error: {e}")
-    finally:
-        cur.close(); release_pg(conn)
-    if not row or not row["cookie_encrypted"]:
-        raise HTTPException(404, "No saved credentials — connect with a code first")
-    cookie = row["cookie_encrypted"]
-    try:
-        info = await validate_cookie(cookie)
-    except HTTPException:
-        raise HTTPException(401, "Saved cookie expired — reconnect from extension")
-    session = get_session(body.profile_id)
-    session.cookie              = cookie
-    session.account_info        = info
-    session.extension_last_seen = time.time()
-    cfg_check = get_config(body.profile_id)
-    if (cfg_check.get("_monitoringActive") or cfg_check.get("autoStartMonitoring")) and not session.monitoring:
-        session.monitoring   = True
-        session.monitor_task = asyncio.create_task(monitor_loop(body.profile_id))
-        set_cfg(body.profile_id, "_monitoringActive", True)
-    return {**info, "profile_id": body.profile_id}
-
-@app.post("/api/credentials/clear")
-def api_clear_credentials(body: MonitorBody):
-    """Fully unlink ALL Roblox accounts — wipes all saved_credentials AND in-memory session."""
-    if PG_URL:
-        conn = get_pg()
-        cur  = conn.cursor()
-        try:
-            cur.execute("DELETE FROM saved_credentials WHERE profile_id=%s", (body.profile_id,))
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            print(f"[SENTINEL] Failed to clear credentials: {e}")
-        finally:
-            cur.close(); release_pg(conn)
-    session = get_session(body.profile_id)
-    session.cookie       = None
-    session.account_info = None
-    return {"cleared": True}
-
-class RemoveAccountBody(BaseModel):
-    profile_id:     str
-    roblox_user_id: str
-
-@app.post("/api/credentials/remove-account")
-def api_remove_account(body: RemoveAccountBody):
-    """Remove a single saved Roblox account by user ID."""
-    uid = str(body.roblox_user_id).strip()
-    if not uid:
-        raise HTTPException(400, "roblox_user_id is required")
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        # Match on roblox_user_id column (stored as text)
-        cur.execute(
-            "DELETE FROM saved_credentials WHERE profile_id=%s AND roblox_user_id=%s",
-            (body.profile_id, uid)
-        )
-        deleted = cur.rowcount
-        if deleted == 0:
-            # Fallback: try matching userId field inside the account_info JSON
-            cur.execute(
-                "DELETE FROM saved_credentials WHERE profile_id=%s AND account_info->>'userId'=%s",
-                (body.profile_id, uid)
-            )
-            deleted = cur.rowcount
-        conn.commit()
-        print(f"[SENTINEL] remove-account uid={uid} profile={body.profile_id} deleted={deleted}")
-        if deleted == 0:
-            raise HTTPException(404, f"Account {uid} not found in saved credentials")
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        print(f"[SENTINEL] Failed to remove account: {e}")
-        raise HTTPException(500, f"Database error: {e}")
-    finally:
-        cur.close(); release_pg(conn)
-    # If the currently active session belongs to this account, clear it
-    session = get_session(body.profile_id)
-    if session.account_info and str(session.account_info.get("userId", "")) == uid:
-        session.cookie       = None
-        session.account_info = None
-    return {"removed": True, "userId": uid}
-
-class ManualCookieBody(BaseModel):
-    profile_id: str
-    cookie:     str
-
-@app.post("/api/credentials/manual")
-async def api_manual_cookie(body: ManualCookieBody):
-    """Add a Roblox account via manually entered cookie.
-    ALWAYS saves to Postgres regardless of saveCookies setting (user is explicitly consenting by entering manually)."""
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured — manual cookie requires database")
-    try:
-        info = await validate_cookie(body.cookie)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Could not verify cookie: {e}")
-    roblox_uid = info.get("userId", "")
-    if not roblox_uid:
-        raise HTTPException(400, "Could not determine Roblox user ID")
-    # Always save — user explicitly entered this
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute(
-            """INSERT INTO saved_credentials (profile_id, roblox_user_id, cookie_encrypted, account_info)
-               VALUES (%s,%s,%s,%s)
-               ON CONFLICT (profile_id, roblox_user_id) DO UPDATE
-               SET cookie_encrypted=%s, account_info=%s, saved_at=NOW()""",
-            (body.profile_id, roblox_uid, body.cookie, json.dumps(info), body.cookie, json.dumps(info))
-        )
-        conn.commit()
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, f"Failed to save credentials: {e}")
-    finally:
-        cur.close(); release_pg(conn)
-    # Set as active session
-    session = get_session(body.profile_id)
-    session.cookie       = body.cookie
-    session.account_info = info
-    # Immediately mark valid in sanity cache — don't wait for next scheduled check
-    _sanity_mark_valid(
-        body.profile_id,
-        roblox_uid,
-        info.get("displayName") or info.get("username") or str(roblox_uid),
-        body.cookie,
-        info,
-    )
-    cfg_check = get_config(body.profile_id)
-    should_start = cfg_check.get("_monitoringActive") or cfg_check.get("autoStartMonitoring")
-    if should_start and not session.monitoring:
-        session.monitoring   = True
-        session.monitor_task = asyncio.create_task(monitor_loop(body.profile_id))
-        set_cfg(body.profile_id, "_monitoringActive", True)
-    return {**info, "profile_id": body.profile_id}
-
-class RelinkSavedBody(BaseModel):
-    profile_id:     str
-    roblox_user_id: str
-
-@app.post("/api/credentials/relink-saved")
-async def api_relink_saved(body: RelinkSavedBody):
-    """Activate a previously saved Roblox account by userId (no cookie needed from client).
-    Restores cookie from Postgres and sets as the active session."""
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT cookie_encrypted, account_info FROM saved_credentials WHERE profile_id=%s AND roblox_user_id=%s",
-            (body.profile_id, body.roblox_user_id)
-        )
-        row = cur.fetchone()
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, f"Database error: {e}")
-    finally:
-        cur.close(); release_pg(conn)
-    if not row or not row["cookie_encrypted"]:
-        raise HTTPException(404, "Account not found in saved credentials")
-    cookie = row["cookie_encrypted"]
-    # Verify cookie is still valid
-    try:
-        info = await validate_cookie(cookie)
-    except HTTPException:
-        raise HTTPException(401, "Saved cookie has expired — please re-add this account")
-    except Exception as e:
-        raise HTTPException(500, f"Could not verify cookie: {e}")
-    session = get_session(body.profile_id)
-    session.cookie       = cookie
-    session.account_info = info
-    # Immediately mark valid in sanity cache
-    roblox_uid_str = str(info.get("userId", body.roblox_user_id))
-    _sanity_mark_valid(
-        body.profile_id,
-        roblox_uid_str,
-        info.get("displayName") or info.get("username") or roblox_uid_str,
-        cookie,
-        info,
-    )
-    cfg_check = get_config(body.profile_id)
-    should_start = cfg_check.get("_monitoringActive") or cfg_check.get("autoStartMonitoring")
-    if should_start and not session.monitoring:
-        session.monitoring   = True
-        session.monitor_task = asyncio.create_task(monitor_loop(body.profile_id))
-        set_cfg(body.profile_id, "_monitoringActive", True)
-    # Update saved account info (displayName/avatar may have changed)
-    roblox_uid = info.get("userId", body.roblox_user_id)
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute(
-            "UPDATE saved_credentials SET account_info=%s, saved_at=NOW() WHERE profile_id=%s AND roblox_user_id=%s",
-            (json.dumps(info), body.profile_id, roblox_uid)
-        )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"[SENTINEL] Failed to update account info: {e}")
-    finally:
-        cur.close(); release_pg(conn)
-    return {**info, "profile_id": body.profile_id}
-
-@app.post("/api/extension/unlink")
-def api_extension_unlink(body: MonitorBody):
-    """Unlink only the extension session (in-memory cookie cleared).
-    Saved credentials in Postgres are preserved so the dashboard stays linked."""
-    session = get_session(body.profile_id)
-    session.cookie       = None
-    session.account_info = None
-    return {"unlinked": True}
-
-@app.get("/api/saved-accounts")
-def api_saved_accounts(profile_id: str = ""):
-    """Return list of all saved Roblox accounts for a profile."""
-    if not PG_URL or not profile_id:
-        return []
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT roblox_user_id, account_info, saved_at FROM saved_credentials WHERE profile_id=%s ORDER BY saved_at DESC",
-            (profile_id,)
-        )
-        rows = cur.fetchall()
-        result = []
-        for row in rows:
-            info = row["account_info"]
-            if isinstance(info, str):
-                try: info = json.loads(info)
-                except: info = {}
-            elif isinstance(info, dict):
-                pass  # already parsed by psycopg2
-            if info and isinstance(info, dict):
-                saved_at = row["saved_at"] if "saved_at" in row.keys() else None
-                result.append({**info, "saved_at": str(saved_at or "")})
-        return result
-    except Exception as e:
-        print(f"[SENTINEL] saved-accounts error: {e}")
-        return []
-    finally:
-        cur.close(); release_pg(conn)
-
-class RelinkBody(BaseModel):
-    profile_id: str
-    cookie:     str
-
-@app.post("/api/credentials/relink")
-async def api_relink(body: RelinkBody):
-    """Relink using a provided cookie.
-    If a different account is already active and save mode is ask/always,
-    the new account goes to pending_save without displacing the active session."""
-    try:
-        info = await validate_cookie(body.cookie)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Could not verify Roblox session: {e}")
-
-    session    = get_session(body.profile_id)
-    cfg        = get_config(body.profile_id)
-    roblox_uid = info.get("userId", "")
-    save_mode  = cfg.get("cookieSaveMode", "ask")
-
-    # Determine if this is a brand-new account being added or just a re-auth
-    current_uid    = (session.account_info or {}).get("userId", "")
-    is_new_account = bool(current_uid and roblox_uid and roblox_uid != current_uid)
-
-    if PG_URL and roblox_uid:
-        already_saved = False
-        conn2 = get_pg(); cur2 = conn2.cursor()
-        try:
-            cur2.execute(
-                "SELECT 1 FROM saved_credentials WHERE profile_id=%s AND roblox_user_id=%s",
-                (body.profile_id, roblox_uid)
-            )
-            already_saved = cur2.fetchone() is not None
-        except Exception as e:
-            print(f"[SENTINEL] Error checking saved credentials: {e}")
-        finally:
-            cur2.close(); release_pg(conn2)
-
-        if is_new_account and save_mode in ("ask", "always"):
-            # Don't switch active session — queue as pending so dashboard can handle it
-            if save_mode == "always":
-                conn3 = get_pg(); cur3 = conn3.cursor()
-                try:
-                    cur3.execute(
-                        """INSERT INTO saved_credentials (profile_id, roblox_user_id, cookie_encrypted, account_info)
-                           VALUES (%s,%s,%s,%s)
-                           ON CONFLICT (profile_id, roblox_user_id) DO UPDATE
-                           SET cookie_encrypted=%s, account_info=%s, saved_at=NOW()""",
-                        (body.profile_id, roblox_uid, body.cookie, json.dumps(info),
-                         body.cookie, json.dumps(info))
-                    )
-                    conn3.commit()
-                except Exception as e:
-                    conn3.rollback()
-                    print(f"[SENTINEL] Failed to auto-save new account: {e}")
-                finally:
-                    cur3.close(); release_pg(conn3)
-                session.pending_save      = False
-                session.pending_save_info = None
-            else:
-                # ask — flag for popup, don't switch active session
-                session.pending_save      = True
-                session.pending_save_info = {**info, "_cookie": body.cookie}
-            return {**info, "profile_id": body.profile_id}
-
-        # Same account re-auth or no active account — switch normally
-        session.cookie       = body.cookie
-        session.account_info = info
-        session.extension_last_seen = time.time()
-        should_start = cfg.get("_monitoringActive") or cfg.get("autoStartMonitoring")
-        if should_start and not session.monitoring:
-            session.monitoring   = True
-            session.monitor_task = asyncio.create_task(monitor_loop(body.profile_id))
-            set_cfg(body.profile_id, "_monitoringActive", True)
-
-        if already_saved:
-            conn3 = get_pg(); cur3 = conn3.cursor()
-            try:
-                cur3.execute(
-                    "UPDATE saved_credentials SET cookie_encrypted=%s, account_info=%s, saved_at=NOW() WHERE profile_id=%s AND roblox_user_id=%s",
-                    (body.cookie, json.dumps(info), body.profile_id, roblox_uid)
-                )
-                conn3.commit()
-            except Exception as e:
-                conn3.rollback()
-            finally:
-                cur3.close(); release_pg(conn3)
-        elif save_mode == "always":
-            conn3 = get_pg(); cur3 = conn3.cursor()
-            try:
-                cur3.execute(
-                    """INSERT INTO saved_credentials (profile_id, roblox_user_id, cookie_encrypted, account_info)
-                       VALUES (%s,%s,%s,%s)
-                       ON CONFLICT (profile_id, roblox_user_id) DO UPDATE
-                       SET cookie_encrypted=%s, account_info=%s, saved_at=NOW()""",
-                    (body.profile_id, roblox_uid, body.cookie, json.dumps(info),
-                     body.cookie, json.dumps(info))
-                )
-                conn3.commit()
-            except Exception as e:
-                conn3.rollback()
-            finally:
-                cur3.close(); release_pg(conn3)
-        elif save_mode == "ask" and not already_saved and not is_new_account:
-            session.pending_save      = True
-            session.pending_save_info = {**info, "_cookie": body.cookie}
-    else:
-        # No PG or no uid — just switch session
-        session.cookie       = body.cookie
-        session.account_info = info
-        session.extension_last_seen = time.time()
-
-    return {**info, "profile_id": body.profile_id}
-
-# ── MONITORING ────────────────────────────────────────────────────────────────
-
-@app.post("/api/monitoring/start")
-async def api_start(body: MonitorBody):
-    session = get_session(body.profile_id)
-    # Headless mode: if no in-memory cookie but saved credentials exist, restore them
-    if not session.cookie and PG_URL:
-        conn = get_pg(); cur = conn.cursor()
-        try:
-            cur.execute(
-                "SELECT cookie_encrypted, account_info FROM saved_credentials WHERE profile_id=%s ORDER BY saved_at DESC LIMIT 1",
-                (body.profile_id,)
-            )
-            cred = cur.fetchone()
-            if cred and cred["cookie_encrypted"]:
-                session.cookie       = cred["cookie_encrypted"]
-                session.account_info = cred["account_info"]
-                print(f"[SENTINEL] Headless mode: restored credentials for profile {body.profile_id}")
-        except Exception as e:
-            print(f"[SENTINEL] Headless restore error: {e}")
-        finally:
-            cur.close(); release_pg(conn)
-    if not session.cookie:
-        raise HTTPException(400, "No credentials. Connect a Roblox account first.")
-    if session.monitoring:
-        return {"status": "already_running"}
-    # Clear ALL cached unsupported types on a manual start so fresh start retries everything.
-    # The user explicitly pressed Start — treat it as a clean slate.
-    _unsupported_group_types.clear()
-    sentinel_log(f"Cleared unsupported type cache on monitoring start for {body.profile_id[:8]}", "INFO", "MONITOR")
-    session.monitoring   = True
-    session.monitor_task = asyncio.create_task(monitor_loop(body.profile_id))
-    set_cfg(body.profile_id, "_monitoringActive", True)   # persist so it survives restarts
-    return {"status": "started"}
-
-@app.post("/api/monitoring/stop")
-async def api_stop(body: MonitorBody):
-    session = get_session(body.profile_id)
-    session.monitoring = False
-    set_cfg(body.profile_id, "_monitoringActive", False)  # persist
-    if session.monitor_task:
-        session.monitor_task.cancel()
-        try:
-            await session.monitor_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        session.monitor_task = None
-    return {"status": "stopped"}
-
-# ── GROUPS ────────────────────────────────────────────────────────────────────
-
-@app.get("/api/groups")
-def api_list_groups(profile_id: str = ""):
-    return db_exec(
-        "SELECT id, name, added_at FROM groups WHERE profile_id=? ORDER BY added_at DESC",
-        (profile_id,), fetch="all"
-    ) or []
-
-@app.post("/api/groups")
-async def api_add_group(body: GroupBody):
-    gid = body.id.strip()
-    if not gid.isdigit():
-        raise HTTPException(400, "Group ID must be numeric")
-    session = get_session(body.profile_id)
-    name = body.name.strip() or await get_group_name(gid, cookie=session.cookie)
-    t = time.time()
-    db_upsert("groups", ["id", "profile_id"],
-              {"id": gid, "profile_id": body.profile_id, "name": name, "added_at": t})
-    return {"id": gid, "name": name, "added_at": t}
-
-@app.delete("/api/groups/{group_id}")
-def api_remove_group(group_id: str, profile_id: str = ""):
-    db_exec("DELETE FROM groups WHERE id=? AND profile_id=?", (group_id, profile_id))
-    session = get_session(profile_id)
-    session.known_assets.pop(f"{profile_id}:{group_id}", None)
-    return {"deleted": True}
-
-# ── HISTORY ───────────────────────────────────────────────────────────────────
-
-@app.get("/api/history")
-def api_history(profile_id: str = "", limit: int = 200, search: str = ""):
-    if search:
-        s = f"%{search}%"
-        return db_exec(
-            "SELECT * FROM history WHERE profile_id=?"
-            " AND (username LIKE ? OR audio_name LIKE ? OR audio_id LIKE ?)"
-            " ORDER BY time DESC LIMIT ?",
-            (profile_id, s, s, s, limit), fetch="all"
-        ) or []
-    return db_exec(
-        "SELECT * FROM history WHERE profile_id=? ORDER BY time DESC LIMIT ?",
-        (profile_id, limit), fetch="all"
-    ) or []
-
-@app.delete("/api/history")
-def api_clear_history(profile_id: str = ""):
-    db_exec("DELETE FROM history WHERE profile_id=?", (profile_id,))
-    return {"cleared": True}
-
-# ── RESTORE ───────────────────────────────────────────────────────────────────
-
-class ArchiveAssetBody(BaseModel):
-    profile_id: str
-    asset_id:   str
-    history_id: Optional[str] = None
-
-@app.post("/api/archive-asset")
-async def api_archive_asset(body: ArchiveAssetBody):
-    """Manually archive a single Roblox asset from the dashboard (e.g. re-archive a restored asset)."""
-    session = get_session(body.profile_id)
-    if not session.cookie:
-        raise HTTPException(400, "No credentials — connect a Roblox account first")
-    aid = body.asset_id.strip()
-    if not aid:
-        raise HTTPException(400, "asset_id is required")
-    ok = await archive_asset(aid, cookie=session.cookie)
-    sentinel_log(f"Manual archive {aid}: {'OK' if ok else 'FAILED'}", "ARCHIVE" if ok else "ERROR", "RESTORE")
-    if ok:
-        # Mark all history rows for this asset as archived again
-        db_exec(
-            "UPDATE history SET archived=1 WHERE audio_id=? AND profile_id=?",
-            (aid, body.profile_id),
-        )
-    return {"ok": ok, "asset_id": aid}
-
-@app.post("/api/restore")
-async def api_restore(body: RestoreBody):
-    """Restore a single archived Roblox asset using the active session cookie."""
-    session = get_session(body.profile_id)
-    if not session.cookie:
-        raise HTTPException(400, "No credentials — connect a Roblox account first")
-    aid = body.asset_id.strip()
-    if not aid:
-        raise HTTPException(400, "asset_id is required")
-    ok = await restore_asset(aid, cookie=session.cookie)
-    sentinel_log(f"Manual restore {aid}: {'OK' if ok else 'FAILED'}", "ARCHIVE" if ok else "ERROR", "RESTORE")
-    if ok:
-        # Mark ALL history rows for this asset as restored (archived=0) so monitor won't re-archive
-        db_exec(
-            "UPDATE history SET archived=0 WHERE audio_id=? AND profile_id=?",
-            (aid, body.profile_id),
-        )
-    return {"ok": ok, "asset_id": aid}
-
-
-@app.post("/api/restore/bulk")
-async def api_restore_bulk(body: RestoreBulkBody):
-    """Restore multiple archived assets in sequence, returning per-asset results."""
-    session = get_session(body.profile_id)
-    if not session.cookie:
-        raise HTTPException(400, "No credentials — connect a Roblox account first")
-    if not body.asset_ids:
-        raise HTTPException(400, "asset_ids list is empty")
-    results: list[dict] = []
-    for aid in body.asset_ids:
-        aid = str(aid).strip()
-        if not aid:
-            continue
-        ok = await restore_asset(aid, cookie=session.cookie)
-        sentinel_log(f"Bulk restore {aid}: {'OK' if ok else 'FAILED'}", "ARCHIVE" if ok else "ERROR", "RESTORE")
-        if ok:
-            db_exec(
-                "UPDATE history SET archived=0 WHERE audio_id=? AND profile_id=?",
-                (aid, body.profile_id),
-            )
-        results.append({"asset_id": aid, "ok": ok})
-        await asyncio.sleep(0.3)  # avoid rate-limiting
-    succeeded = sum(1 for r in results if r["ok"])
-    sentinel_log(f"Bulk restore complete: {succeeded}/{len(results)} succeeded", "ARCHIVE", "RESTORE")
-    return {"results": results, "succeeded": succeeded, "total": len(results)}
-
-
-# ── STATS ─────────────────────────────────────────────────────────────────────
-
-@app.get("/api/stats")
-def api_stats(profile_id: str = ""):
-    archived = db_exec("SELECT COUNT(*) AS c FROM history WHERE profile_id=? AND archived=1",
-                       (profile_id,), fetch="val") or 0
-    dms      = db_exec("SELECT COUNT(*) AS c FROM history WHERE profile_id=? AND dm_status='sent'",
-                       (profile_id,), fetch="val") or 0
-    groups   = db_exec("SELECT COUNT(*) AS c FROM groups WHERE profile_id=?",
-                       (profile_id,), fetch="val") or 0
-    wl = len(get_config(profile_id).get("whitelist_all", []))
-    return {"archived": archived, "dms": dms, "groups": groups, "whitelisted": wl}
-
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-
-@app.get("/api/config")
-def api_get_config(profile_id: str = ""):
-    return get_config(profile_id)
-
-@app.post("/api/config")
-def api_update_config(body: ConfigBody):
-    data = body.model_dump(exclude_none=True)
-    pid  = data.pop("profile_id", "")
-    if "cookieSaveMode" in data and data["cookieSaveMode"] not in ("ask", "always", "never"):
-        raise HTTPException(400, "cookieSaveMode must be 'ask', 'always', or 'never'")
-    for k, v in data.items():
-        set_cfg(pid, k, v)
-    # If cookieSaveMode changed to "never", wipe saved credentials
-    if data.get("cookieSaveMode") == "never" and PG_URL:
-        conn2 = get_pg(); cur2 = conn2.cursor()
-        try:
-            cur2.execute("DELETE FROM saved_credentials WHERE profile_id=%s", (pid,))
-            conn2.commit()
-        except Exception as e:
-            conn2.rollback()
-            print(f"[SENTINEL] Error clearing credentials on mode=never: {e}")
-        finally:
-            cur2.close(); release_pg(conn2)
-    return get_config(pid)
-
-# ── ACCESS CONTROL ───────────────────────────────────────────────────────────
-
-def _require_admin(profile_id: str, pin: str, cur) -> dict:
-    cur.execute("SELECT id, name, is_admin FROM profiles WHERE id=%s AND pin_hash=%s",
-                (profile_id, hash_pin(pin)))
-    row = cur.fetchone()
-    if not row or not row["is_admin"]:
-        raise HTTPException(403, "Admin access required")
-    return dict(row)
-
-@app.post("/api/access/request")
-def api_submit_access_request(body: AccessRequestBody, background_tasks: BackgroundTasks):
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    if not body.name.strip() or not body.reason.strip() or not body.email.strip():
-        raise HTTPException(400, "Name, email and reason are required")
-    req_id = str(uuid.uuid4())
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO access_requests (id, name, reason, email) VALUES (%s,%s,%s,%s)",
-            (req_id, body.name.strip(), body.reason.strip(), body.email.strip())
-        )
-        approve_token = secrets.token_urlsafe(32)
-        deny_token    = secrets.token_urlsafe(32)
-        expires       = datetime.utcnow() + timedelta(hours=24)
-        cur.execute("INSERT INTO review_tokens (token,request_id,action,expires_at) VALUES (%s,%s,%s,%s)",
-                    (approve_token, req_id, "approve", expires))
-        cur.execute("INSERT INTO review_tokens (token,request_id,action,expires_at) VALUES (%s,%s,%s,%s)",
-                    (deny_token, req_id, "deny", expires))
-        conn.commit()
-        if ADMIN_EMAIL and BASE_URL:
-            background_tasks.add_task(send_email, ADMIN_EMAIL, f"[Sentinel] Access Request from {body.name.strip()}",
-                f"""<div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0f0f0f;color:#fff;padding:32px;border-radius:12px;">
-  <h2 style="color:#fff;letter-spacing:2px;margin-top:0;">SENTINEL</h2>
-  <h3 style="color:#aaa;font-weight:400;">New Access Request</h3>
-  <table style="width:100%;border-collapse:collapse;margin-bottom:24px;">
-    <tr><td style="color:#888;padding:6px 0;width:80px;">Name</td><td style="color:#fff;">{body.name.strip()}</td></tr>
-    <tr><td style="color:#888;padding:6px 0;">Email</td><td style="color:#fff;">{body.email.strip()}</td></tr>
-    <tr><td style="color:#888;padding:6px 0;vertical-align:top;">Reason</td><td style="color:#fff;">{body.reason.strip()}</td></tr>
-  </table>
-  <p style="color:#888;font-size:12px;">Links expire in 24 hours.</p>
-  <a href="{BASE_URL}/review.html?token={approve_token}" style="display:inline-block;background:#4ade80;color:#000;font-weight:700;padding:12px 28px;border-radius:6px;text-decoration:none;margin-right:12px;">Approve</a>
-  <a href="{BASE_URL}/review.html?token={deny_token}" style="display:inline-block;background:#ef4444;color:#fff;font-weight:700;padding:12px 28px;border-radius:6px;text-decoration:none;">Deny</a>
-</div>""")
-        return {"id": req_id, "status": "pending"}
-    except HTTPException:
-        conn.rollback(); raise
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-@app.get("/api/review")
-def api_review_get(token: str):
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM review_tokens WHERE token=%s", (token,))
-        tok = cur.fetchone()
-        if not tok: raise HTTPException(404, "Invalid token")
-        if tok["used"]: return {"status":"already_used","action":tok["action"]}
-        if datetime.utcnow() > tok["expires_at"].replace(tzinfo=None):
-            return {"status":"expired","action":tok["action"]}
-        cur.execute("SELECT * FROM access_requests WHERE id=%s", (tok["request_id"],))
-        req = cur.fetchone()
-        if not req: raise HTTPException(404, "Request not found")
-        if req["status"] != "pending":
-            return {"status":"already_actioned","action":req["status"],"name":req["name"]}
-        return {"status":"pending","action":tok["action"],"name":req["name"],
-                "email":req["email"],"reason":req["reason"],"expires_at":str(tok["expires_at"])}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-@app.post("/api/review")
-def api_review_post(token: str, background_tasks: BackgroundTasks):
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM review_tokens WHERE token=%s", (token,))
-        tok = cur.fetchone()
-        if not tok: raise HTTPException(404, "Invalid token")
-        if tok["used"]: return {"status":"already_used"}
-        if datetime.utcnow() > tok["expires_at"].replace(tzinfo=None):
-            return {"status":"expired"}
-        cur.execute("SELECT * FROM access_requests WHERE id=%s", (tok["request_id"],))
-        req = cur.fetchone()
-        if not req: raise HTTPException(404, "Request not found")
-        if req["status"] != "pending":
-            return {"status":"already_actioned"}
-        action = tok["action"]
-        if action == "approve":
-            code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-            cur.execute("INSERT INTO invite_codes (code,created_by) VALUES (%s,%s)", (code,"admin-email"))
-            cur.execute("UPDATE access_requests SET status='approved',invite_code=%s WHERE id=%s", (code,tok["request_id"]))
-            cur.execute("UPDATE review_tokens SET used=TRUE WHERE request_id=%s", (tok["request_id"],))
-            conn.commit()
-            background_tasks.add_task(send_email, req["email"], "[Sentinel] You've been approved!", f"""
-<div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0f0f0f;color:#fff;padding:32px;border-radius:12px;">
-  <h2 style="color:#fff;letter-spacing:2px;margin-top:0;">SENTINEL</h2>
-  <p style="color:#ccc;">Hey {req["name"]}, your Sentinel access request has been approved!</p>
-  <p style="color:#888;font-size:13px;margin-bottom:8px;">Your one-time invite code:</p>
-  <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:16px;text-align:center;font-family:monospace;font-size:28px;letter-spacing:6px;color:#4ade80;margin-bottom:24px;">{code}</div>
-  <p style="color:#888;font-size:12px;">Enter this when creating your profile. It can only be used once.</p>
-</div>""")
-            return {"status":"approved","name":req["name"],"email":req["email"],"invite_code":code}
-        else:
-            cur.execute("UPDATE access_requests SET status='denied' WHERE id=%s", (tok["request_id"],))
-            cur.execute("UPDATE review_tokens SET used=TRUE WHERE request_id=%s", (tok["request_id"],))
-            conn.commit()
-            background_tasks.add_task(send_email, req["email"], "[Sentinel] Access request update", f"""
-<div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0f0f0f;color:#fff;padding:32px;border-radius:12px;">
-  <h2 style="color:#fff;letter-spacing:2px;margin-top:0;">SENTINEL</h2>
-  <p style="color:#ccc;">Hey {req["name"]}, your Sentinel access request has been denied.</p>
-  <p style="color:#888;font-size:12px;">Contact the admin if you think this is a mistake.</p>
-</div>""")
-            return {"status":"denied","name":req["name"]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-@app.get("/api/admin/requests")
-def api_admin_requests(profile_id: str, pin: str):
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        _require_admin(profile_id, pin, cur)
-        cur.execute("SELECT * FROM access_requests ORDER BY created_at DESC")
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
-    except HTTPException: raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: cur.close(); release_pg(conn)
-
-@app.post("/api/admin/generate-invite")
-def api_generate_invite(body: GenerateInviteBody):
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        _require_admin(body.admin_id, body.admin_pin, cur)
-        code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-        cur.execute("INSERT INTO invite_codes (code,created_by) VALUES (%s,%s)", (code, body.admin_id))
-        conn.commit()
-        return {"code": code}
-    except HTTPException: conn.rollback(); raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: cur.close(); release_pg(conn)
-
-@app.post("/api/admin/set-admin")
-def api_set_admin(body: SetAdminBody):
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        _require_admin(body.admin_id, body.admin_pin, cur)
-        cur.execute("UPDATE profiles SET is_admin=%s WHERE id=%s", (body.is_admin, body.target_id))
-        conn.commit()
-        return {"updated": True}
-    except HTTPException: conn.rollback(); raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: cur.close(); release_pg(conn)
-
-class ApproveRequestBody(BaseModel):
-    admin_id:    str
-    admin_pin:   str
-    request_id:  str
-    invite_code: str
-
-class DenyRequestBody(BaseModel):
-    admin_id:   str
-    admin_pin:  str
-    request_id: str
-
-@app.post("/api/admin/approve-request")
-def api_approve_request(body: ApproveRequestBody, background_tasks: BackgroundTasks):
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        _require_admin(body.admin_id, body.admin_pin, cur)
-        cur.execute("SELECT * FROM access_requests WHERE id=%s", (body.request_id,))
-        req = cur.fetchone()
-        if not req: raise HTTPException(404, "Request not found")
-        cur.execute("UPDATE access_requests SET status='approved', invite_code=%s WHERE id=%s",
-                    (body.invite_code, body.request_id))
-        conn.commit()
-        background_tasks.add_task(send_email, req["email"], "[Sentinel] You've been approved!", f"""
-<div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0f0f0f;color:#fff;padding:32px;border-radius:12px;">
-  <h2 style="color:#fff;letter-spacing:2px;margin-top:0;">SENTINEL</h2>
-  <p style="color:#ccc;">Hey {req["name"]}, your access has been approved!</p>
-  <p style="color:#888;font-size:13px;margin-bottom:8px;">Your one-time invite code:</p>
-  <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:16px;text-align:center;font-family:monospace;font-size:28px;letter-spacing:6px;color:#4ade80;margin-bottom:24px;">{body.invite_code}</div>
-  <p style="color:#888;font-size:12px;">Enter this when creating your profile. It can only be used once.</p>
-</div>""")
-        return {"ok": True}
-    except HTTPException: conn.rollback(); raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: cur.close(); release_pg(conn)
-
-@app.post("/api/admin/deny-request")
-def api_deny_request(body: DenyRequestBody, background_tasks: BackgroundTasks):
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        _require_admin(body.admin_id, body.admin_pin, cur)
-        cur.execute("SELECT * FROM access_requests WHERE id=%s", (body.request_id,))
-        req = cur.fetchone()
-        if not req: raise HTTPException(404, "Request not found")
-        cur.execute("UPDATE access_requests SET status='denied' WHERE id=%s", (body.request_id,))
-        conn.commit()
-        background_tasks.add_task(send_email, req["email"], "[Sentinel] Access request update", f"""
-<div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0f0f0f;color:#fff;padding:32px;border-radius:12px;">
-  <h2 style="color:#fff;letter-spacing:2px;margin-top:0;">SENTINEL</h2>
-  <p style="color:#ccc;">Hey {req["name"]}, your request has been denied.</p>
-  <p style="color:#888;font-size:12px;">Contact the admin if you think this is a mistake.</p>
-</div>""")
-        return {"ok": True}
-    except HTTPException: conn.rollback(); raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: cur.close(); release_pg(conn)
-
-@app.get("/api/admin/make-me-admin")
-def make_me_admin():
-    if not PG_URL: raise HTTPException(503, "Postgres not configured")
-    target_id = "f5087f66-a860-49dd-8d38-46e6b68ac99d"
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE;")
-        conn.commit()
-        cur.execute("SELECT name, is_admin FROM profiles WHERE id=%s", (target_id,))
-        row = cur.fetchone()
-        if not row: raise HTTPException(404, "Profile not found")
-        if row["is_admin"]: return {"ok": True, "message": "Already admin!"}
-        cur.execute("UPDATE profiles SET is_admin=TRUE WHERE id=%s", (target_id,))
-        conn.commit()
-        return {"ok": True, "message": f"✓ '{row['name']}' is now admin!"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-@app.get("/review.html", response_class=HTMLResponse)
-def serve_review():
-    p = BASE_DIR / "static" / "review.html"
-    if p.exists(): return HTMLResponse(p.read_text(), 200)
-    raise HTTPException(404, "review.html not found in static/")
-
-# ── MISC ──────────────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup_event():
-    global _MASTER_KEY
-    asyncio.create_task(memory_watchdog())
-    asyncio.create_task(sanity_check_loop())   # cookie validity checks every 5 min + on boot
-
-    # Print / generate master key
-    if not _MASTER_KEY:
-        _MASTER_KEY = secrets.token_urlsafe(32)
-        sentinel_log(
-            f"SENTINEL_MASTER_KEY not set — generated for this session: {_MASTER_KEY}  "
-            "Set this as an env var on Render to make it permanent.",
-            "WARN", "VAULT"
-        )
-    else:
-        sentinel_log("Vault master key loaded from environment", "INFO", "VAULT")
-
-    asyncio.create_task(vault_auto_restore())   # restore from URL if DB is empty
-    sentinel_log("SENTINEL backend started", "INFO", "SYSTEM")
-    if PG_URL:
-        _sc = None
-        try:
-            _sc = get_pg(); _scur = _sc.cursor()
-            for sql in [
-                "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''",
-                "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS pin_length INTEGER DEFAULT 4",
-                "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE",
-                # Multi-account credential migration — drop old single-row PK, add roblox_user_id col
-                "ALTER TABLE saved_credentials ADD COLUMN IF NOT EXISTS roblox_user_id TEXT NOT NULL DEFAULT ''",
-                "ALTER TABLE saved_credentials DROP CONSTRAINT IF EXISTS saved_credentials_pkey",
-                # Re-add composite PK now that roblox_user_id exists
-                # (IF NOT EXISTS not available for ADD CONSTRAINT, handled via unique index instead)
-                "CREATE UNIQUE INDEX IF NOT EXISTS saved_credentials_uid ON saved_credentials(profile_id, roblox_user_id)",
-            ]:
-                try: _scur.execute(sql + ";"); _sc.commit()
-                except Exception as _e: _sc.rollback(); print(f"[SENTINEL] Migration: {_e}")
-            _scur.execute("""CREATE TABLE IF NOT EXISTS access_requests (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL, reason TEXT NOT NULL,
-                email TEXT NOT NULL DEFAULT '', status TEXT DEFAULT 'pending',
-                invite_code TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW());""")
-            _scur.execute("""CREATE TABLE IF NOT EXISTS invite_codes (
-                code TEXT PRIMARY KEY, created_by TEXT NOT NULL,
-                used BOOLEAN DEFAULT FALSE, used_by TEXT DEFAULT '',
-                created_at TIMESTAMPTZ DEFAULT NOW());""")
-            _scur.execute("""CREATE TABLE IF NOT EXISTS review_tokens (
-                token TEXT PRIMARY KEY, request_id TEXT NOT NULL,
-                action TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
-                used BOOLEAN DEFAULT FALSE);""")
-            try: _scur.execute("ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT '';"); _sc.commit()
-            except Exception as _e: _sc.rollback()
-            _sc.commit()
-            sentinel_log("Startup migrations OK", "INFO", "SYSTEM")
-        except Exception as _e:
-            sentinel_log(f"Startup migration error: {_e}", "ERROR", "SYSTEM")
-            if _sc:
-                try: _sc.rollback()
-                except: pass
-        finally:
-            if _sc:
-                try: _scur.close()
-                except: pass
-                release_pg(_sc)
-
-@app.get("/api/health")
-def health():
-    # RENDER_GIT_COMMIT is set automatically by Render on every deploy and
-    # only changes when a new build actually ships — a crash/restart of the
-    # same build keeps the same value. Falls back to "dev" outside Render.
-    version = os.environ.get("RENDER_GIT_COMMIT", "dev")
-    return {"ok": True, "version": version}
-
-@app.get("/api/sanity-check/status")
-def api_sanity_status(profile_id: str = ""):
-    """Return sanity check results for a profile's saved accounts.
-    Returns per-account validity + global check state (running, last_run, phase2)."""
-    # Strip internal-only fields (cookie, acc_info) before sending to frontend
-    raw_results = _sanity_results.get(profile_id, {}) if profile_id else {}
-    safe_results = {}
-    for uid, data in raw_results.items():
-        safe_results[uid] = {
-            "valid":      data.get("valid", True),
-            "checked_at": data.get("checked_at", 0),
-            "username":   data.get("username", uid),
-            "userId":     data.get("userId", uid),
+      } catch {}
+    }, 3000);
+  } catch(e) { toast('Could not generate code: ' + e.message, 'error'); }
+}
+
+// ── ADD ANOTHER ACCOUNT MODAL ─────────────────────────────────────────────────
+
+let _addAnotherPollTimer = null;
+let _addAnotherDetectedInfo = null;
+
+function openAddAnotherModal() {
+  _addAnotherDetectedInfo = null;
+  const modal = document.getElementById('add-another-modal');
+  if (modal) modal.classList.add('open');
+  backToAddPicker(); // always start at picker
+  if (_addAnotherPollTimer) { clearInterval(_addAnotherPollTimer); _addAnotherPollTimer = null; }
+}
+
+function backToAddPicker() {
+  // Reset all flows, show picker
+  _addAnotherDetectedInfo = null;
+  if (_addAnotherPollTimer) { clearInterval(_addAnotherPollTimer); _addAnotherPollTimer = null; }
+  document.getElementById('add-another-picker').style.display      = 'block';
+  document.getElementById('add-another-ext-flow').style.display    = 'none';
+  document.getElementById('add-another-cookie-flow').style.display = 'none';
+  // Reset card hover states
+  ['add-via-ext-card','add-via-cookie-card'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.borderColor = '';
+  });
+}
+
+function selectAddMethod(method) {
+  if (EXT_MAINTENANCE && method === 'extension') { extBlocked(); return; }
+  if (method === 'extension') {
+    document.getElementById('add-another-ext-flow').style.display = 'block';
+    // Reset extension flow state
+    const dot = document.getElementById('add-another-dot');
+    const statusTx = document.getElementById('add-another-status-text');
+    const detected = document.getElementById('add-another-detected');
+    const doneBtn  = document.getElementById('add-another-done-btn');
+    if (dot)      dot.style.background = 'var(--text-dimmer)';
+    if (statusTx) statusTx.textContent = 'Waiting for extension…';
+    if (detected) detected.style.display = 'none';
+    if (doneBtn)  { doneBtn.disabled = true; doneBtn.textContent = 'Confirm & Save Account'; }
+    // Start polling for pending save
+    _addAnotherPollTimer = setInterval(async () => {
+      try {
+        const status = await api('GET', `/api/status?profile_id=${pid()}`);
+        if (status.pendingSave && status.pendingSaveAccount) {
+          updateAddAnotherDetected(status.pendingSaveAccount);
         }
+      } catch {}
+    }, 2000);
+  } else {
+    document.getElementById('add-another-cookie-flow').style.display = 'block';
+    const inp = document.getElementById('add-another-cookie-input');
+    if (inp) { inp.value = ''; inp.focus(); }
+  }
+}
 
-    # Determine if active account is expired
-    active_expired = False
-    if profile_id:
-        session = _sessions.get(profile_id)
-        if session and session.account_info:
-            active_uid  = str(session.account_info.get("userId", ""))
-            acct_result = raw_results.get(active_uid, {})
-            if acct_result and not acct_result.get("valid", True):
-                active_expired = True
+async function submitAddAnotherCookie() {
+  let cookie = (document.getElementById('add-another-cookie-input')?.value || '').trim();
+  if (!cookie) { toast('Paste your cookie first', 'error'); return; }
+  // Strip Roblox warning prefix
+  if (cookie.includes('|_')) cookie = cookie.split('|_').pop().trim();
+  cookie = cookie.replace(/^[|_]+/, '').replace(/[|_]+$/, '').trim();
+  if (!cookie) { toast('Could not extract cookie — paste the full .ROBLOSECURITY value', 'error'); return; }
+  const btn = document.getElementById('add-another-cookie-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Verifying…'; }
+  try {
+    await api('POST', '/api/credentials/manual', { profile_id: pid(), cookie });
+    closeAddAnotherModal();
+    await refreshSavedAccounts();
+    await refreshStatus();
+    toast('✓ Account added successfully', 'success');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Add Account'; }
+  }
+}
 
-    # Phase 2 state for this profile
-    p2 = _sanity_phase2_state.get(profile_id, {"active": False, "countdown": 0})
+function closeAddAnotherModal() {
+  if (_addAnotherPollTimer) { clearInterval(_addAnotherPollTimer); _addAnotherPollTimer = null; }
+  _addAnotherDetectedInfo = null;
+  const modal = document.getElementById('add-another-modal');
+  if (modal) modal.classList.remove('open');
+  // Cancel the pending save on backend so it doesn't show the popup
+  api('POST', '/api/credentials/dismiss-pending', { profile_id: pid() }).catch(() => {});
+}
 
-    return {
-        "running":          _sanity_running,
-        "last_run":         _sanity_last_run,
-        "accounts":         safe_results,
-        "active_expired":   active_expired,
-        "phase2_active":    p2.get("active", False),
-        "phase2_countdown": p2.get("countdown", 0),
+function updateAddAnotherDetected(account) {
+  // Only trigger once per account to avoid flicker
+  if (_addAnotherDetectedInfo && _addAnotherDetectedInfo.userId === account.userId) return;
+  _addAnotherDetectedInfo = account;
+
+  const modal = document.getElementById('add-another-modal');
+  if (!modal || !modal.classList.contains('open')) return;
+
+  const waiting   = document.getElementById('add-another-waiting');
+  const detected  = document.getElementById('add-another-detected');
+  const doneBtn   = document.getElementById('add-another-done-btn');
+  const dot       = document.getElementById('add-another-dot');
+  const statusTx  = document.getElementById('add-another-status-text');
+  const nameEl    = document.getElementById('add-another-name');
+  const userEl    = document.getElementById('add-another-user');
+  const avatarEl  = document.getElementById('add-another-avatar');
+
+  // Update dot to green-ish
+  if (dot)      dot.style.background = 'rgba(100,255,160,0.8)';
+  if (statusTx) statusTx.textContent = '✓ Account detected — review below';
+
+  if (nameEl)   nameEl.textContent = account.displayName || account.username || '—';
+  if (userEl)   userEl.textContent = '@' + (account.username || '—') + ' · ' + (account.userId || '—');
+  if (avatarEl) {
+    avatarEl.innerHTML = account.avatarUrl
+      ? `<img src="${account.avatarUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`
+      : (account.displayName || '?')[0];
+  }
+
+  if (waiting)  waiting.style.display  = 'flex';
+  if (detected) detected.style.display = 'block';
+  if (doneBtn)  doneBtn.disabled = false;
+}
+
+async function disconnectExtension() {
+  if (EXT_MAINTENANCE) { extBlocked(); return; }
+  try {
+    toast('Disconnect signal sent to extension', 'success');
+    // Update button state — it'll go grey when next status poll sees extensionLinked = false
+    const btn = document.getElementById('disconnect-ext-btn');
+    if (btn) { btn.textContent = 'Signal sent…'; btn.disabled = true; }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function confirmAddAnother() {
+  if (!_addAnotherDetectedInfo) return;
+  const doneBtn = document.getElementById('add-another-done-btn');
+  if (doneBtn) { doneBtn.disabled = true; doneBtn.textContent = 'Saving…'; }
+  try {
+    await api('POST', '/api/credentials/save-pending', { profile_id: pid() });
+    await refreshSavedAccounts();
+    closeAddAnotherModal();
+    toast('✓ Account added successfully', 'success');
+    await refreshStatus();
+  } catch(e) {
+    toast('Error saving account: ' + e.message, 'error');
+    if (doneBtn) { doneBtn.disabled = false; doneBtn.textContent = 'Done — Account Added'; }
+  }
+}
+
+async function testConnection() {
+  try {
+    const status = await api('GET', `/api/status?profile_id=${pid()}`);
+    toast(status.hasCredential ? `✓ Connected — ${status.account?.displayName}` : 'No credential found', status.hasCredential ? 'success' : 'error');
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+function showManualCookieInput() {
+  document.getElementById('manual-cookie-section').style.display = 'block';
+  document.getElementById('add-account-section').style.display = 'none';
+  document.getElementById('manual-cookie-input').value = '';
+  document.getElementById('manual-cookie-input').focus();
+}
+
+function hideManualCookieInput() {
+  document.getElementById('manual-cookie-section').style.display = 'none';
+  document.getElementById('add-account-section').style.display = 'block';
+}
+
+async function submitManualCookie() {
+  let cookie = document.getElementById('manual-cookie-input').value.trim();
+  if (!cookie) { toast('Paste your cookie first', 'error'); return; }
+
+  // Strip Roblox warning prefix — cookie format is:
+  // _|WARNING:-DO-NOT-SHARE-THIS...|_ACTUAL_COOKIE_VALUE
+  // Split on |_ and take everything after the last occurrence
+  if (cookie.includes('|_')) {
+    const parts = cookie.split('|_');
+    cookie = parts[parts.length - 1].trim();
+  }
+  // Also strip leading/trailing underscores or pipes left over
+  cookie = cookie.replace(/^[|_]+/, '').replace(/[|_]+$/, '').trim();
+
+  if (!cookie) { toast('Could not extract cookie value — paste the full .ROBLOSECURITY value', 'error'); return; }
+  if (!pid()) { toast('Not signed into a profile — please sign in first', 'error'); return; }
+
+  const btn = document.querySelector('#manual-cookie-section .btn-primary');
+  if (btn) { btn.disabled = true; btn.textContent = 'Verifying…'; }
+  try {
+    const res = await api('POST', '/api/credentials/manual', { profile_id: pid(), cookie });
+    hideManualCookieInput();
+    STATE.hasCredential = true;
+    updateAccountDisplay(res);
+    document.getElementById('connected-account-section').style.display = 'block';
+    document.getElementById('add-account-section').style.display = 'none';
+    await refreshSavedAccounts();
+    await refreshStatus();
+    toast(`✓ Account added: ${res.displayName || res.username}`, 'success');
+  } catch(e) {
+    toast('Failed to add account: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Add Account'; }
+  }
+}
+
+// ── GROUPS ────────────────────────────────────────────────────────────────────
+async function addGroup() {
+  let val = document.getElementById('group-url-input').value.trim();
+  let gid = val;
+  const match = val.match(/groups\/(\d+)/);
+  if (match) gid = match[1];
+  else if (!/^\d+$/.test(val)) { toast('Invalid group URL or ID', 'error'); return; }
+  try {
+    const g = await api('POST', '/api/groups', { id: gid, profile_id: pid() });
+    document.getElementById('group-url-input').value = '';
+    await refreshGroups();
+    await refreshStats();
+    toast(`Group "${g.name}" added`, 'success');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+
+
+async function removeGroup(id) {
+  if (!confirm('Remove this group?')) return;
+  try {
+    await api('DELETE', `/api/groups/${id}?profile_id=${pid()}`);
+    await refreshGroups();
+    await refreshStats();
+    toast('Group removed', 'warn');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function refreshGroups() {
+  const groups = await api('GET', `/api/groups?profile_id=${pid()}`).catch(() => []);
+  const list = document.getElementById('groups-list');
+  if (!list) return;
+  if (!groups.length) {
+    list.innerHTML = '<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);padding:20px 0;text-align:center;">No groups added yet.</div>';
+    return;
+  }
+  list.innerHTML = groups.map(g => `
+    <div class="group-item">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div style="width:36px;height:36px;border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.4);font-family:var(--font-mono);font-size:11px;flex-shrink:0;">GRP</div>
+        <div>
+          <div style="font-weight:700;font-size:15px;">${esc(g.name)}</div>
+          <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);">ID: ${esc(g.id)}</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="badge badge-active">● Monitoring</span>
+        <button class="btn btn-danger btn-sm" onclick="removeGroup('${esc(g.id)}')">Remove</button>
+      </div>
+    </div>`).join('');
+}
+
+// ── HISTORY ───────────────────────────────────────────────────────────────────
+let _cachedHistory = [];
+
+async function refreshHistory() {
+  const search = document.getElementById('history-search')?.value || '';
+  const params = new URLSearchParams({ limit: 200, profile_id: pid() });
+  if (search) params.append('search', search);
+  const items = await api('GET', `/api/history?${params}`).catch(() => []);
+
+  if (items.length > _prevHistCount && _prevHistCount > 0) {
+    document.getElementById('history-badge').classList.add('show');
+    const newest = items[0];
+    toast(`Archived: "${newest.audio_name}" by ${newest.display_name || newest.username}`, 'success');
+  }
+  _prevHistCount = items.length;
+  _cachedHistory = items;
+
+  // Recent activity on dashboard
+  const ra = document.getElementById('recent-activity');
+  if (ra) {
+    const recent = items.slice(0,10);
+    if (!recent.length) {
+      ra.innerHTML = '<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);padding:20px 0;text-align:center;">No activity yet.</div>';
+    } else {
+      ra.innerHTML = recent.map(e => `
+        <div style="padding:8px 0;border-bottom:1px solid var(--border);font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">
+          <span style="color:rgba(255,255,255,0.4);">▶</span>
+          [${esc(e.time)}]
+          <span style="color:rgba(200,180,255,0.8);">${esc(e.asset_type || 'Asset')}</span>
+          "${esc(e.audio_name)}" — <span style="color:rgba(255,255,255,0.7);">${esc(e.display_name||e.username)}</span>
+          ${e.group_name ? `<span style="color:rgba(255,255,255,0.35);margin-left:6px;">📂 ${esc(e.group_name)}</span>` : ''}
+        </div>`).join('');
+    }
+  }
+
+  if (document.getElementById('tab-history')?.classList.contains('active')) renderHistoryList(items);
+}
+
+function filterHistory() { refreshHistory(); }
+
+// ── Restore state ──────────────────────────────────────────────────────────────
+let _selectModeOn   = false;
+let _selectedIds    = new Set();
+let _restoredAssets = new Set(); // asset IDs already restored this session
+
+function toggleSelectMode(on) {
+  _selectModeOn = on;
+  if (!on) {
+    _selectedIds.clear();
+    document.getElementById('restore-toolbar').classList.remove('visible');
+  } else {
+    document.getElementById('restore-toolbar').classList.add('visible');
+  }
+  renderHistoryList(_cachedHistory);
+}
+
+function selectAllHistory() {
+  _selectedIds.clear();
+  const typeq = document.getElementById('history-filter-type')?.value || '';
+  _cachedHistory.forEach(item => {
+    if (typeq && item.asset_type !== typeq) return;
+    if (!_restoredAssets.has(item.audio_id)) _selectedIds.add(item.id);
+  });
+  renderHistoryList(_cachedHistory);
+  updateRestoreToolbar();
+}
+
+function deselectAllHistory() {
+  _selectedIds.clear();
+  renderHistoryList(_cachedHistory);
+  updateRestoreToolbar();
+}
+
+function updateRestoreToolbar() {
+  const n = _selectedIds.size;
+  const label = document.getElementById('restore-count-label');
+  const btn   = document.getElementById('bulk-restore-btn');
+  if (label) label.textContent = n + ' selected';
+  if (btn)   btn.disabled = n === 0;
+}
+
+function toggleHistorySelect(histId, audioId, el) {
+  if (_restoredAssets.has(audioId)) return;
+  if (_selectedIds.has(histId)) {
+    _selectedIds.delete(histId);
+    el.classList.remove('checked');
+    el.textContent = '';
+  } else {
+    _selectedIds.add(histId);
+    el.classList.add('checked');
+    el.textContent = '✓';
+  }
+  updateRestoreToolbar();
+}
+
+function renderHistoryList(items) {
+  const list = document.getElementById('history-list');
+  if (!list) return;
+  const typeq = document.getElementById('history-filter-type')?.value || '';
+  let filtered = items;
+  if (typeq) filtered = filtered.filter(i => i.asset_type === typeq);
+  if (!filtered.length) {
+    list.innerHTML = '<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dimmer);padding:20px 0;text-align:center;">No history.</div>';
+    return;
+  }
+  list.innerHTML = filtered.map(item => {
+    const isRestored = _restoredAssets.has(item.audio_id);
+    const isChecked  = _selectedIds.has(item.id);
+    const checkHtml  = _selectModeOn ? `
+      <div class="history-check${isChecked ? ' checked' : ''}"
+           onclick="toggleHistorySelect('${esc(item.id)}','${esc(item.audio_id)}',this)"
+           title="${isChecked ? 'Deselect' : 'Select'}">${isChecked ? '✓' : ''}</div>` : '';
+    const restoreHtml = !_selectModeOn ? (isRestored
+      ? `<button class="btn-restore" style="border-color:rgba(255,59,59,0.3);color:rgba(255,100,100,0.8);background:rgba(255,59,59,0.06);"
+               id="rb-${esc(item.id)}"
+               onclick="archiveAgain('${esc(item.audio_id)}','${esc(item.id)}',this)">↩ Archive Again</button>`
+      : `<button class="btn-restore"
+               id="rb-${esc(item.id)}"
+               onclick="restoreSingle('${esc(item.audio_id)}','${esc(item.id)}',this)">↩ Restore</button>`)
+      : '';
+    const restoredBadge = isRestored ? `<span class="badge-restored">Restored</span>` : '';
+    return `
+    <div class="history-item" id="hr-${esc(item.id)}">
+      ${checkHtml}
+      <div class="history-avatar">${esc(((item.display_name||item.username||'?').slice(0,2)).toUpperCase())}</div>
+      <div class="history-user" style="flex:1;min-width:0;">
+        <div class="display-name">${esc(item.display_name||item.username)}</div>
+        <div class="username">@${esc(item.username)} · UID: ${esc(item.user_id||'—')}</div>
+        <div class="history-audio">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+          ${esc(item.audio_name)} · ID: ${esc(item.audio_id)}
+          <span class="badge badge-info" style="margin-left:6px;">${esc(item.asset_type||'Audio')}</span>
+          ${item.group_name ? `<span style="color:rgba(255,255,255,0.4);margin-left:8px;">📂 ${esc(item.group_name)}</span>` : ''}
+        </div>
+      </div>
+      <div class="history-meta">
+        <div class="history-time">${esc(item.time)}</div>
+        ${restoredBadge}
+        ${restoreHtml}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function restoreSingle(audioId, histId, btn) {
+  if (!audioId) { toast('No asset ID', 'error'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
+  try {
+    const res = await api('POST', '/api/restore', { profile_id: pid(), asset_id: audioId });
+    if (res.ok) {
+      _restoredAssets.add(audioId);
+      // Update ALL rows with this audio_id in the rendered list
+      _cachedHistory.forEach(item => {
+        if (item.audio_id === audioId) {
+          const rb = document.getElementById('rb-' + item.id);
+          if (rb) {
+            rb.textContent = '↩ Archive Again';
+            rb.style.borderColor = 'rgba(255,59,59,0.3)';
+            rb.style.color = 'rgba(255,100,100,0.8)';
+            rb.style.background = 'rgba(255,59,59,0.06)';
+            rb.onclick = function() { archiveAgain(audioId, item.id, rb); };
+            rb.disabled = false;
+          }
+          const row = document.getElementById('hr-' + item.id);
+          if (row) {
+            const meta = row.querySelector('.history-meta');
+            if (meta && !meta.querySelector('.badge-restored')) {
+              const badge = document.createElement('span');
+              badge.className = 'badge-restored';
+              badge.textContent = 'Restored';
+              meta.insertBefore(badge, rb || null);
+            }
+          }
+        }
+      });
+      toast('↩ Restored asset ' + audioId, 'success');
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = '↩ Restore'; }
+      toast('Restore failed for ' + audioId + ' — check account permissions', 'error');
+    }
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.textContent = '↩ Restore'; }
+    toast('Restore error: ' + e.message, 'error');
+  }
+}
+
+async function archiveAgain(audioId, histId, btn) {
+  if (!audioId) { toast('No asset ID', 'error'); return; }
+  if (!confirm('Archive asset ' + audioId + ' again? The monitor will skip re-archiving it only if it stays in the history as restored.')) return;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
+  try {
+    const res = await api('POST', '/api/archive-asset', { profile_id: pid(), asset_id: audioId });
+    if (res.ok) {
+      _restoredAssets.delete(audioId);
+      // Update ALL rows with this audio_id
+      _cachedHistory.forEach(item => {
+        if (item.audio_id === audioId) {
+          const rb = document.getElementById('rb-' + item.id);
+          if (rb) {
+            rb.textContent = '↩ Restore';
+            rb.style.borderColor = '';
+            rb.style.color = '';
+            rb.style.background = '';
+            rb.onclick = function() { restoreSingle(audioId, item.id, rb); };
+            rb.disabled = false;
+          }
+          const row = document.getElementById('hr-' + item.id);
+          if (row) {
+            const badge = row.querySelector('.badge-restored');
+            if (badge) badge.remove();
+          }
+        }
+      });
+      toast('Archived asset ' + audioId, 'success');
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = '↩ Archive Again'; }
+      toast('Archive failed for ' + audioId, 'error');
+    }
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.textContent = '↩ Archive Again'; }
+    toast('Archive error: ' + e.message, 'error');
+  }
+}
+
+async function bulkRestore() {
+  const ids = [..._selectedIds];
+  if (!ids.length) { toast('Nothing selected', 'warn'); return; }
+  if (!confirm('Restore ' + ids.length + ' asset' + (ids.length !== 1 ? 's' : '') + '? They will go live again on Roblox.')) return;
+  const btn      = document.getElementById('bulk-restore-btn');
+  const progress = document.getElementById('restore-progress');
+  if (btn)      { btn.disabled = true; btn.textContent = '⏳ Restoring…'; }
+  if (progress) { progress.style.display = 'inline'; progress.textContent = '0 / ' + ids.length; }
+  const histMap = {};
+  _cachedHistory.forEach(item => { histMap[item.id] = item.audio_id; });
+  const assetIds = ids.map(hid => histMap[hid]).filter(Boolean);
+  try {
+    const res = await api('POST', '/api/restore/bulk', { profile_id: pid(), asset_ids: assetIds });
+    (res.results || []).forEach(r => { if (r.ok) _restoredAssets.add(r.asset_id); });
+    _selectedIds.clear();
+    // Re-render so all rows with restored asset IDs update their buttons
+    renderHistoryList(_cachedHistory);
+    updateRestoreToolbar();
+    const s = res.succeeded ?? 0, t = res.total ?? assetIds.length;
+    toast(s === t ? '↩ All ' + t + ' assets restored' : 'Restored ' + s + '/' + t + ' — ' + (t - s) + ' failed', s === t ? 'success' : 'warn');
+  } catch(e) {
+    toast('Bulk restore error: ' + e.message, 'error');
+  } finally {
+    if (btn)      { btn.disabled = false; btn.textContent = '↩ Restore Selected'; }
+    if (progress) { progress.style.display = 'none'; }
+  }
+}
+
+
+
+async function clearHistory() {
+  if (!confirm('Clear all history for this profile?')) return;
+  await api('DELETE', `/api/history?profile_id=${pid()}`);
+  _cachedHistory = []; _prevHistCount = 0;
+  await refreshHistory(); await refreshStats();
+  toast('History cleared', 'warn');
+}
+
+// ── STATS ─────────────────────────────────────────────────────────────────────
+async function refreshStats() {
+  const s = await api('GET', `/api/stats?profile_id=${pid()}`).catch(() => ({}));
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v ?? '0'; };
+  set('stat-archived', s.archived);
+  set('stat-groups', s.groups);
+  set('stat-whitelisted', s.whitelisted);
+  // Show headless vs extension mode
+  const modeEl = document.getElementById('stat-headless');
+  if (modeEl) {
+    if (STATE.monitoring) {
+      modeEl.textContent = STATE.hasCredential ? 'LIVE' : 'HEADLESS';
+      modeEl.style.color = STATE.monitoring ? 'rgba(100,255,160,0.9)' : '';
+    } else {
+      modeEl.textContent = '—';
+      modeEl.style.color = '';
+    }
+  }
+}
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+let _cfg = {};
+
+async function loadConfigFromApi() {
+  _cfg = await api('GET', `/api/config?profile_id=${pid()}`).catch(() => ({}));
+
+  const poll  = document.getElementById('polling-slider');
+  const delay = document.getElementById('delay-slider');
+  if (poll)  { poll.value  = _cfg.pollingInterval ?? 60; document.getElementById('polling-val').textContent  = (_cfg.pollingInterval ?? 60) + 's'; }
+  if (delay) { delay.value = _cfg.archiveDelay    ?? 0;  document.getElementById('delay-val').textContent    = (_cfg.archiveDelay    ?? 0)  + 's'; }
+
+  const ae = document.getElementById('archive-existing-toggle');
+  if (ae) ae.className = 'toggle-sw' + (_cfg.archiveExisting ? ' on' : '');
+
+  const fp = document.getElementById('fast-poll-toggle');
+  if (fp) fp.className = 'toggle-sw' + (_cfg.allowFastPolling ? ' on' : '');
+
+  const ast = document.getElementById('auto-start-toggle');
+  if (ast) ast.className = 'toggle-sw' + (_cfg.autoStartMonitoring ? ' on' : '');
+
+  syncSaveModeUI(_cfg.cookieSaveMode || 'ask');
+
+  // Update polling slider min based on fast poll setting
+  if (poll) poll.min = _cfg.allowFastPolling ? '5' : '30';
+
+  buildAssetFilterGrid();
+  buildWlTabs();
+}
+
+
+
+function buildAssetFilterGrid() {
+  const grid = document.getElementById('asset-filter-grid');
+  if (!grid) return;
+  const selected = _cfg.assetTypeFilters || ALL_ASSET_TYPES;
+  grid.innerHTML = ALL_ASSET_TYPES.map(t => `
+    <div class="asset-chip ${selected.includes(t) ? 'selected' : ''}" onclick="toggleAssetChip(this,'${t}')">
+      <div class="asset-chip-dot"></div>
+      ${t}
+    </div>`).join('');
+}
+
+function toggleAssetChip(el, type) {
+  el.classList.toggle('selected');
+}
+
+function selectAllAssetTypes() {
+  document.querySelectorAll('.asset-chip').forEach(c => c.classList.add('selected'));
+}
+
+function buildWlTabs() {
+  const tabs = document.getElementById('wl-tabs');
+  if (!tabs) return;
+  tabs.innerHTML = ['all', ...ALL_ASSET_TYPES].map(t => `
+    <button class="wl-tab ${STATE.activeWlTab === t ? 'active' : ''}" onclick="switchWlTab('${t}')">
+      ${t === 'all' ? 'All Types' : t}
+    </button>`).join('');
+  loadWlForTab(STATE.activeWlTab);
+}
+
+function switchWlTab(tab) {
+  // Save current tab's value first
+  saveWlTab(STATE.activeWlTab);
+  STATE.activeWlTab = tab;
+  buildWlTabs();
+  loadWlForTab(tab);
+}
+
+function saveWlTab(tab) {
+  const key   = tab === 'all' ? 'whitelist_all' : `whitelist_${tab}`;
+  const value = document.getElementById('whitelist-input')?.value.split('\n').filter(l => l.trim()) || [];
+  _cfg[key] = value;
+}
+
+function loadWlForTab(tab) {
+  const key   = tab === 'all' ? 'whitelist_all' : `whitelist_${tab}`;
+  const label = document.getElementById('wl-current-label');
+  const input = document.getElementById('whitelist-input');
+  if (label) label.textContent = `Whitelisted Users — ${tab === 'all' ? 'All Types' : tab}`;
+  if (input) input.value = (_cfg[key] || []).join('\n');
+  updateWhitelistCount();
+}
+
+function updateWhitelistCount() {
+  const val   = document.getElementById('whitelist-input')?.value || '';
+  const count = val.split('\n').filter(l => l.trim()).length;
+  const el    = document.getElementById('whitelist-count');
+  if (el) el.textContent = count + ' user' + (count !== 1 ? 's' : '');
+}
+
+function checkFastPollWarning(val) {
+  const warn = document.getElementById('fast-poll-warning');
+  const fp   = document.getElementById('fast-poll-toggle');
+  if (!warn) return;
+  const fastEnabled = fp?.classList.contains('on');
+  warn.style.display = (val < 30 && fastEnabled) ? 'block' : 'none';
+}
+
+function toggleFastPoll(el) {
+  el.classList.toggle('on');
+  const on   = el.classList.contains('on');
+  const poll = document.getElementById('polling-slider');
+  if (poll) {
+    poll.min = on ? '5' : '30';
+    if (!on && parseInt(poll.value) < 30) { poll.value = '30'; document.getElementById('polling-val').textContent = '30s'; }
+  }
+  if (!on) document.getElementById('fast-poll-warning').style.display = 'none';
+}
+
+function syncSaveModeUI(mode) {
+  ['ask','always','never'].forEach(m => {
+    const el = document.getElementById('smode-' + m);
+    if (el) el.classList.toggle('active', m === mode);
+  });
+}
+
+async function setCookieSaveMode(mode) {
+  if (!pid()) { toast('No profile active', 'error'); return; }
+  syncSaveModeUI(mode);
+  try {
+    const confirmed = mode === 'never'
+      ? confirm('Setting to "Never save" will delete all saved accounts from the database. Continue?')
+      : true;
+    if (!confirmed) { syncSaveModeUI(_cfg.cookieSaveMode || 'ask'); return; }
+    await api('POST', '/api/config', { profile_id: pid(), cookieSaveMode: mode });
+    _cfg.cookieSaveMode = mode;
+    const labels = { ask: 'Will ask before saving', always: 'Always saving accounts', never: 'Never saving accounts' };
+    toast(labels[mode], mode === 'never' ? 'warn' : 'success');
+    if (mode === 'never') await refreshSavedAccounts();
+  } catch(e) {
+    syncSaveModeUI(_cfg.cookieSaveMode || 'ask');
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+// ── SAVE ACCOUNT POPUP ────────────────────────────────────────────────────────
+let _popupShowing = false;
+
+function showSaveAccountPopup(account) {
+  if (_popupShowing) return;
+  _popupShowing = true;
+  const popup = document.getElementById('save-account-popup');
+  const avatarEl = document.getElementById('save-popup-avatar');
+  const nameEl   = document.getElementById('save-popup-name');
+  const subEl    = document.getElementById('save-popup-username');
+  if (!popup) return;
+  if (account.avatarUrl) {
+    avatarEl.innerHTML = `<img src="${esc(account.avatarUrl)}">`;
+  } else {
+    avatarEl.textContent = (account.displayName || '?').charAt(0).toUpperCase();
+  }
+  nameEl.textContent = account.displayName || account.username || 'Roblox Account';
+  subEl.textContent  = '@' + (account.username || '') + ' · UID ' + (account.userId || '');
+  popup.classList.add('visible');
+}
+
+function hidePopup() {
+  const popup = document.getElementById('save-account-popup');
+  if (popup) popup.classList.remove('visible');
+  _popupShowing = false;
+}
+
+async function savePendingAccount() {
+  try {
+    const res = await api('POST', '/api/credentials/save-pending', { profile_id: pid() });
+    hidePopup();
+    if (res.saved) {
+      toast('Account saved to dashboard ✓', 'success');
+      await refreshSavedAccounts();
+    }
+  } catch(e) {
+    hidePopup();
+    toast('Error saving: ' + e.message, 'error');
+  }
+}
+
+async function dismissSavePrompt() {
+  try {
+    await api('POST', '/api/credentials/dismiss-pending', { profile_id: pid() });
+  } catch(_) {}
+  hidePopup();
+}
+
+async function saveConfig() {
+  // Save current whitelist tab first
+  saveWlTab(STATE.activeWlTab);
+
+  const selectedTypes = [...document.querySelectorAll('.asset-chip.selected')].map(c => c.textContent.trim());
+
+  const body = {
+    profile_id:       pid(),
+    pollingInterval:  parseInt(document.getElementById('polling-slider').value),
+    archiveDelay:     parseInt(document.getElementById('delay-slider').value),
+    archiveExisting:  document.getElementById('archive-existing-toggle').classList.contains('on'),
+    allowFastPolling: document.getElementById('fast-poll-toggle').classList.contains('on'),
+    assetTypeFilters: selectedTypes,
+  };
+
+  // Add all whitelists from _cfg (already kept in sync via saveWlTab)
+  ['all', ...ALL_ASSET_TYPES].forEach(t => {
+    const key = t === 'all' ? 'whitelist_all' : `whitelist_${t}`;
+    body[key] = _cfg[key] || [];
+  });
+
+  try {
+    const saved = await api('POST', '/api/config', body);
+    // Update in-memory _cfg so chip state survives tab switches without re-fetching
+    _cfg = { ..._cfg, ...saved };
+    await refreshStats();
+    toast('Config saved', 'success');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+
+
+async function exportConfig() {
+  const [cfg, groups] = await Promise.all([
+    api('GET', `/api/config?profile_id=${pid()}`),
+    api('GET', `/api/groups?profile_id=${pid()}`),
+  ]);
+  const blob = new Blob([JSON.stringify({ config: cfg, groups }, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `sentinel_config_${STATE.profileName || 'profile'}.json`;
+  a.click();
+  toast('Config exported', 'success');
+}
+
+async function clearConfig() {
+  if (!confirm('Reset config to defaults?')) return;
+  await api('POST', '/api/config', { profile_id: pid(), pollingInterval: 60, archiveDelay: 0, whitelist_all: [], assetTypeFilters: ALL_ASSET_TYPES });
+  await loadConfigFromApi();
+  toast('Config reset', 'warn');
+}
+
+function updateSlider(id, val, suffix) {
+  document.getElementById(id).textContent = val + (suffix || '');
+}
+
+// ── SETTINGS MODAL ────────────────────────────────────────────────────────────
+function showSettingsTab(name) {
+  document.querySelectorAll('.settings-tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.settings-tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('stab-' + name).classList.add('active');
+  document.getElementById('stab-btn-' + name).classList.add('active');
+}
+
+// Toggles the PIN-based controls vs. the EXE Account panel depending on
+// whether the current profile has been migrated.
+function applySettingsExeSection() {
+  const pinActions = document.getElementById('settings-pin-actions');
+  const linked     = document.getElementById('settings-exe-linked');
+  const unlinked    = document.getElementById('settings-exe-unlinked');
+  if (!pinActions || !linked || !unlinked) return;
+  if (STATE.migrated) {
+    pinActions.classList.add('hidden');
+    linked.classList.remove('hidden');
+    unlinked.classList.add('hidden');
+    document.getElementById('settings-exe-email').textContent = STATE.exeEmail || '—';
+  } else {
+    pinActions.classList.remove('hidden');
+    linked.classList.add('hidden');
+    unlinked.classList.remove('hidden');
+  }
+}
+
+// "Migrate to EXE Account" button inside Settings, for a profile that's
+// already logged in via PIN — same destination as the post-PIN-entry screen,
+// just reached from a different door. Needs the PIN again since migration
+// changes are permanent.
+function settingsStartMigration() {
+  const pin = prompt(`Enter the PIN for "${STATE.profileName}" to begin migrating to an EXE Account.`);
+  if (pin === null || pin.trim() === '') return;
+  closeSettings();
+  openExeMigrateScreen(STATE.profileId, pin.trim(), {
+    id: STATE.profileId, name: STATE.profileName, avatar_url: STATE.profileAvatar,
+    hasCredential: STATE.hasCredential, is_admin: STATE.isAdmin,
+  });
+  if (_exeMigrateCtx) _exeMigrateCtx.fromSettings = true;
+}
+
+function openSettings() {
+  document.getElementById('settings-modal').classList.add('open');
+  showSettingsTab('profile');
+  const info = document.getElementById('settings-profile-info');
+  if (info) info.textContent = `Signed in as: ${STATE.profileName || '—'} (ID: ${STATE.profileId || '—'})`;
+  if (_cfg) syncSaveModeUI(_cfg.cookieSaveMode || 'ask');
+  applySettingsExeSection();
+
+  // Populate avatar preview
+  const ap = document.getElementById('settings-avatar-preview');
+  if (ap) {
+    if (STATE.profileAvatar) {
+      ap.innerHTML = `<img src="${esc(STATE.profileAvatar)}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" onerror="this.style.display='none'">`;
+    } else {
+      ap.textContent = (STATE.profileName || '?').slice(0,2).toUpperCase();
+    }
+  }
+  document.getElementById('settings-avatar-data').value = '';
+  document.getElementById('settings-avatar-file').value = '';
+  const saveBtn = document.getElementById('settings-avatar-save-btn');
+  if (saveBtn) saveBtn.style.display = 'none';
+
+  // Reset extension dropdown state
+  _settingsCodeOpen = false;
+  const dropdown = document.getElementById('settings-code-dropdown');
+  if (dropdown) dropdown.style.display = 'none';
+  const chevron = document.getElementById('settings-code-chevron');
+  if (chevron) chevron.style.transform = '';
+  if (_settingsCodeTimer) { clearInterval(_settingsCodeTimer); _settingsCodeTimer = null; }
+
+  // Update extension section with current state
+  updateSettingsExtSection();
+
+  // sync debug toggle + panel state
+  const toggle = document.getElementById('debug-mode-toggle');
+  if (toggle) toggle.className = 'toggle-sw' + (_debugMode ? ' on' : '');
+  const panel = document.getElementById('debug-panel-content');
+  if (panel) panel.style.display = _debugMode ? 'block' : 'none';
+  if (_debugMode) { refreshDebugStats(); renderSettingsLogs(); }
+}
+
+function closeSettings() {
+  document.getElementById('settings-modal').classList.remove('open');
+  if (_settingsCodeTimer) { clearInterval(_settingsCodeTimer); _settingsCodeTimer = null; }
+  _settingsCodeOpen = false;
+}
+
+function openChangePinModal() {
+  closeSettings();
+  document.getElementById('change-pin-modal').classList.add('open');
+}
+
+function openChangeNameModal() {
+  closeSettings();
+  document.getElementById('change-name-modal').classList.add('open');
+}
+
+async function changePin() {
+  const current = document.getElementById('cp-current').value.trim();
+  const newPin  = document.getElementById('cp-new').value.trim();
+  if (!current || !newPin) { toast('Fill in both fields', 'error'); return; }
+  try {
+    await api('PUT', '/api/profiles', { profile_id: pid(), pin: current, new_pin: newPin });
+    document.getElementById('change-pin-modal').classList.remove('open');
+    document.getElementById('cp-current').value = '';
+    document.getElementById('cp-new').value = '';
+    toast('PIN updated', 'success');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function changeName() {
+  const pin  = document.getElementById('cn-pin').value.trim();
+  const name = document.getElementById('cn-name').value.trim();
+  if (!pin || !name) { toast('Fill in both fields', 'error'); return; }
+  try {
+    await api('PUT', '/api/profiles', { profile_id: pid(), pin, name });
+    STATE.profileName = name;
+    document.getElementById('topbar-profile-name').textContent = name;
+    document.getElementById('change-name-modal').classList.remove('open');
+    document.getElementById('cn-pin').value  = '';
+    document.getElementById('cn-name').value = '';
+    toast('Name updated', 'success');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+function signOutProfile() {
+  if (_liveInterval) clearInterval(_liveInterval);
+  const wasMigrated = STATE.migrated;
+  const refreshToken = exeReadRefresh();
+  STATE.profileId = null; STATE.profileName = null; STATE.hasCredential = false;
+  closeSettings();
+
+  if (wasMigrated) {
+    // Permanently locked out of the profile selector once migrated — sign out
+    // always lands back on the EXE login screen, never the PIN/profile grid.
+    if (_exeRefreshTimer) { clearTimeout(_exeRefreshTimer); _exeRefreshTimer = null; }
+    STATE.exeAccessToken = null;
+    exeClearRefresh();
+    if (refreshToken) exeApi('POST', '/auth/logout', { refresh_token: refreshToken }).catch(() => {});
+    exeOpenResumeScreen();
+  } else {
+    document.getElementById('profile-screen').classList.remove('hidden');
+    loadProfileScreen();
+  }
+  toast('Signed out', 'warn');
+}
+
+async function deleteProfilePrompt() {
+  const pin = prompt('Enter your PIN to delete this profile.\nTHIS CANNOT BE UNDONE.\n\n(Only the owner can delete a profile.)');
+  if (pin === null || pin.trim() === '') return;
+  try {
+    await api('DELETE', `/api/profiles/${pid()}?pin=${encodeURIComponent(pin.trim())}`);
+    signOutProfile();
+    toast('Profile deleted', 'warn');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+function previewSettingsAvatar(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (file.size > 1024 * 1024) { toast('Image must be under 1MB', 'error'); input.value = ''; return; }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const data = e.target.result;
+    document.getElementById('settings-avatar-data').value = data;
+    const preview = document.getElementById('settings-avatar-preview');
+    preview.innerHTML = `<img src="${data}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+    document.getElementById('settings-avatar-save-btn').style.display = 'inline-flex';
+  };
+  reader.readAsDataURL(file);
+}
+
+async function saveSettingsAvatar() {
+  const data = document.getElementById('settings-avatar-data').value;
+  if (!data) return;
+  const pin = prompt('Enter your PIN to confirm avatar change:');
+  if (pin === null || pin.trim() === '') return;
+  try {
+    await api('PUT', '/api/profiles', { profile_id: pid(), pin: pin.trim(), avatar_url: data });
+    STATE.profileAvatar = data;
+    // Update topbar avatar
+    const avatarEl = document.getElementById('topbar-avatar');
+    if (avatarEl) avatarEl.innerHTML = `<img src="${data}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+    document.getElementById('settings-avatar-save-btn').style.display = 'none';
+    toast('Avatar updated!', 'success');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function clearAllHistory() {
+  if (!confirm('Clear all history for this profile?')) return;
+  await api('DELETE', `/api/history?profile_id=${pid()}`);
+  _cachedHistory = []; _prevHistCount = 0;
+  await refreshHistory(); await refreshStats();
+  closeSettings();
+  toast('History cleared', 'warn');
+}
+
+async function clearCredentials() {
+  if (!confirm('Remove ALL saved Roblox accounts? Monitoring will stop and you will need to re-add accounts.')) return;
+  await api('POST', '/api/credentials/clear', { profile_id: pid() });
+  STATE.hasCredential = false;
+  document.getElementById('connected-account-section').style.display = 'none';
+  updateAccountDisplay(null);
+  await refreshSavedAccounts();
+  closeSettings();
+  toast('All Roblox accounts removed', 'warn');
+}
+
+async function unlinkExtension() {
+  if (EXT_MAINTENANCE) { extBlocked(); return; }
+  if (!confirm('Disconnect the extension? Your saved accounts stay in the database. You can relink anytime using a new code.')) return;
+  try {
+    await api('POST', '/api/extension/command', { profile_id: pid(), command: 'disconnect' });
+    await api('POST', '/api/extension/unlink',  { profile_id: pid() });
+    STATE.extensionLinked = false;
+    updateSettingsExtSection();
+    toast('Extension disconnected — saved accounts preserved', 'warn');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+let _settingsCodeTimer = null;
+let _settingsCodeOpen  = false;
+
+function updateSettingsExtSection() {
+  const ext   = STATE.extensionLinked;
+  const cred  = STATE.hasCredential;
+
+  const dot       = document.getElementById('settings-ext-dot');
+  const label     = document.getElementById('settings-ext-label');
+  const sub       = document.getElementById('settings-ext-sub');
+  const unlinkBtn = document.getElementById('settings-unlink-ext-btn');
+  const linkSec   = document.getElementById('settings-link-ext-section');
+  const noAccSec  = document.getElementById('settings-no-account-section');
+
+  if (!dot) return;
+
+  if (ext && cred) {
+    dot.style.background = 'rgba(100,255,160,0.8)';
+    label.textContent    = 'Extension Connected';
+    sub.textContent      = 'Live session active — heartbeat verified';
+    unlinkBtn.style.display = 'inline-flex';
+    linkSec.style.display   = 'none';
+    noAccSec.style.display  = 'none';
+  } else if (!ext && cred) {
+    dot.style.background = 'rgba(240,192,64,0.8)';
+    label.textContent    = 'Headless Mode';
+    sub.textContent      = 'Account connected but extension offline — link to go live';
+    unlinkBtn.style.display = 'none';
+    linkSec.style.display   = 'block';
+    noAccSec.style.display  = 'none';
+  } else if (ext && !cred) {
+    dot.style.background = 'rgba(255,100,100,0.8)';
+    label.textContent    = 'Extension Online — No Account';
+    sub.textContent      = 'Extension connected but no Roblox account added';
+    unlinkBtn.style.display = 'inline-flex';
+    linkSec.style.display   = 'none';
+    noAccSec.style.display  = 'none';
+  } else {
+    dot.style.background = 'var(--text-dimmer)';
+    label.textContent    = 'Not Connected';
+    sub.textContent      = 'No extension, no account';
+    unlinkBtn.style.display = 'none';
+    linkSec.style.display   = 'none';
+    noAccSec.style.display  = 'block';
+  }
+}
+
+async function toggleSettingsCodeDropdown() {
+  if (EXT_MAINTENANCE) { extBlocked(); return; }
+  const chevron  = document.getElementById('settings-code-chevron');
+  if (!dropdown) return;
+
+  _settingsCodeOpen = !_settingsCodeOpen;
+  dropdown.style.display = _settingsCodeOpen ? 'block' : 'none';
+  if (chevron) chevron.style.transform = _settingsCodeOpen ? 'rotate(180deg)' : '';
+
+  if (_settingsCodeOpen) {
+    // Generate a fresh code
+    if (_settingsCodeTimer) clearInterval(_settingsCodeTimer);
+    try {
+      const res = await api('POST', '/api/connect-code/generate', { profile_id: pid() });
+      document.getElementById('settings-connect-code-display').textContent = res.code;
+      let secs = 300;
+      _settingsCodeTimer = setInterval(async () => {
+        secs--;
+        const m = Math.floor(secs / 60), s = String(secs % 60).padStart(2, '0');
+        const expEl = document.getElementById('settings-code-expiry');
+        if (expEl) expEl.textContent = `Expires in ${m}:${s}`;
+        if (secs <= 0) {
+          clearInterval(_settingsCodeTimer);
+          // Auto-refresh code
+          if (_settingsCodeOpen) {
+            const r2 = await api('POST', '/api/connect-code/generate', { profile_id: pid() });
+            document.getElementById('settings-connect-code-display').textContent = r2.code;
+            secs = 300;
+          }
+        }
+        // Check if extension connected
+        const status = await api('GET', `/api/status?profile_id=${pid()}`).catch(() => null);
+        if (status && status.extensionLinked) {
+          clearInterval(_settingsCodeTimer);
+          _settingsCodeOpen = false;
+          dropdown.style.display = 'none';
+          if (chevron) chevron.style.transform = '';
+          STATE.extensionLinked = true;
+          updateSettingsExtSection();
+          toast('✓ Extension linked!', 'success');
+        }
+      }, 3000);
+    } catch(e) { toast('Could not generate code: ' + e.message, 'error'); }
+  } else {
+    if (_settingsCodeTimer) { clearInterval(_settingsCodeTimer); _settingsCodeTimer = null; }
+  }
+}
+
+async function toggleAutoStart(el) {
+  el.classList.toggle('on');
+  const on = el.classList.contains('on');
+  try {
+    await api('POST', '/api/config', { profile_id: pid(), autoStartMonitoring: on });
+    _cfg.autoStartMonitoring = on;
+    toast(on ? 'Auto-start enabled' : 'Auto-start disabled', on ? 'success' : 'warn');
+  } catch(e) {
+    el.classList.toggle('on');
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function previewAvatar(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (file.size > 1024 * 1024) { toast('Image must be under 1MB', 'error'); input.value = ''; return; }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const data = e.target.result;
+    document.getElementById('new-profile-avatar').value = data;
+    const preview = document.getElementById('avatar-preview');
+    preview.innerHTML = `<img src="${data}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+  };
+  reader.readAsDataURL(file);
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── DEBUG SYSTEM ──────────────────────────────────────────────────────────────
+let _debugMode      = false;
+let _debugInterval  = null;
+let _floatLogOpen   = false;
+let _cachedLogs     = [];
+
+function toggleDebugMode(el) {
+  el.classList.toggle('on');
+  _debugMode = el.classList.contains('on');
+  const panel = document.getElementById('debug-panel-content');
+  const memBar = document.getElementById('mem-bar-wrap');
+  const floatBtn = document.getElementById('log-float-btn');
+  if (_debugMode) {
+    panel.style.display  = 'block';
+    memBar.style.display = 'flex';
+    floatBtn.classList.add('debug-on');
+    refreshDebugStats();
+    renderSettingsLogs();
+    if (!_debugInterval) {
+      _debugInterval = setInterval(() => {
+        refreshDebugStats();
+        if (_floatLogOpen) renderFloatLogs();
+        const settingsOpen = document.getElementById('settings-modal').classList.contains('open');
+        if (settingsOpen) renderSettingsLogs();
+      }, 3000);
+    }
+  } else {
+    panel.style.display  = 'none';
+    memBar.style.display = 'none';
+    floatBtn.classList.remove('debug-on');
+    if (_floatLogOpen) toggleFloatLog();
+    if (_debugInterval) { clearInterval(_debugInterval); _debugInterval = null; }
+  }
+}
+
+async function refreshDebugStats() {
+  try {
+    const data = await api('GET', '/api/debug/memory');
+    // topbar mem bar
+    const pct   = Math.min(data.pct, 100);
+    const fill  = document.getElementById('mem-fill');
+    const wrap  = document.getElementById('mem-bar-wrap');
+    const pctTx = document.getElementById('mem-pct-text');
+    const mbTx  = document.getElementById('mem-mb-text');
+    const degTag = document.getElementById('degraded-tag');
+    if (fill) {
+      fill.style.width = pct + '%';
+      fill.className   = 'mem-fill' + (pct >= 90 ? ' crit' : pct >= 70 ? ' warn' : '');
+    }
+    if (wrap)  wrap.className  = 'mem-bar-wrap' + (pct >= 90 ? ' crit' : pct >= 70 ? ' warn' : '');
+    if (pctTx) pctTx.textContent = pct.toFixed(1) + '%';
+    if (mbTx)  mbTx.textContent  = data.rss_mb + 'MB';
+    if (degTag) degTag.style.display = data.degraded ? 'inline' : 'none';
+
+    // settings panel stats
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('dbg-rss', data.rss_mb);
+    set('dbg-pct', data.pct + '%');
+    set('dbg-cpu', data.cpu_pct + '%');
+    set('dbg-sessions', data.sessions);
+
+    const detail = document.getElementById('dbg-mem-detail');
+    if (detail) detail.textContent =
+      `VMS: ${data.vms_mb}MB  |  Sys avail: ${data.available_mb}MB / ${data.total_mb}MB  |  Sys: ${data.sys_pct}%  |  Limit: ${data.limit_mb}MB  |  Logs buffered: ${data.log_count}`;
+
+    const badge = document.getElementById('dbg-degraded-badge');
+    if (badge) badge.style.display = data.degraded ? 'inline-flex' : 'none';
+
+    // sessions list
+    const sessions = await api('GET', '/api/debug/sessions').catch(() => []);
+    const sl = document.getElementById('dbg-sessions-list');
+    if (sl) {
+      if (!sessions.length) {
+        sl.textContent = 'No active sessions';
+      } else {
+        sl.innerHTML = sessions.map(s => `
+          <div style="padding:4px 0;border-bottom:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap;">
+            <span style="color:rgba(255,255,255,0.5);">ID:</span> <span style="color:#fff;">${esc(s.profile_id.slice(0,8))}…</span>
+            <span style="color:rgba(255,255,255,0.5);">monitoring:</span> <span style="color:${s.monitoring ? 'rgba(100,255,160,0.8)' : '#ff6b6b'};">${s.monitoring}</span>
+            <span style="color:rgba(255,255,255,0.5);">cookie:</span> <span>${s.has_cookie}</span>
+            <span style="color:rgba(255,255,255,0.5);">groups:</span> <span>${s.known_groups}</span>
+            <span style="color:rgba(255,255,255,0.5);">assets:</span> <span>${s.known_assets}</span>
+            <span style="color:rgba(255,255,255,0.5);">task:</span> <span style="color:${s.has_task ? 'rgba(100,255,160,0.8)' : '#ff6b6b'};">${s.has_task}</span>
+          </div>`).join('');
+      }
+    }
+  } catch(e) {
+    console.warn('Debug stats error:', e);
+  }
+}
+
+function buildLogEntry(log) {
+  return `<div class="log-entry">
+    <span class="log-ts">${esc(log.ts)}</span>
+    <span class="log-src">${esc(log.source)}</span>
+    <span class="log-lvl ${esc(log.level)}">${esc(log.level)}</span>
+    <span class="log-msg">${esc(log.msg)}</span>
+  </div>`;
+}
+
+async function fetchLogs(level = '', source = '') {
+  const params = new URLSearchParams({ limit: 300 });
+  if (level)  params.append('level', level);
+  if (source) params.append('source', source);
+  return await api('GET', `/api/debug/logs?${params}`).catch(() => []);
+}
+
+async function renderSettingsLogs() {
+  if (!_debugMode) return;
+  const level  = document.getElementById('settings-log-level')?.value || '';
+  const source = document.getElementById('settings-log-source')?.value || '';
+  const logs   = await fetchLogs(level, source);
+  const box    = document.getElementById('settings-log-box');
+  const count  = document.getElementById('settings-log-count');
+  if (!box) return;
+  if (!logs.length) {
+    box.innerHTML = '<div style="color:var(--text-dimmer);text-align:center;padding:20px 0;font-family:var(--font-mono);font-size:10px;">No logs matching filter</div>';
+  } else {
+    box.innerHTML = logs.map(buildLogEntry).join('');
+    box.scrollTop = box.scrollHeight;
+  }
+  if (count) count.textContent = logs.length + ' entries';
+}
+
+async function renderFloatLogs() {
+  if (!_debugMode || !_floatLogOpen) return;
+  const level  = document.getElementById('float-log-level')?.value || '';
+  const source = document.getElementById('float-log-source')?.value || '';
+  const logs   = await fetchLogs(level, source);
+  const box    = document.getElementById('float-log-entries');
+  if (!box) return;
+  if (!logs.length) {
+    box.innerHTML = '<div style="color:var(--text-dimmer);text-align:center;padding:20px 0;">No logs matching filter</div>';
+  } else {
+    const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+    box.innerHTML = logs.map(buildLogEntry).join('');
+    if (wasAtBottom) box.scrollTop = box.scrollHeight;
+  }
+}
+
+function toggleFloatLog() {
+  if (!_debugMode) {
+    toast('Enable debug mode first', 'warn');
+    return;
+  }
+  _floatLogOpen = !_floatLogOpen;
+  const panel = document.getElementById('log-float-panel');
+  if (_floatLogOpen) {
+    panel.classList.add('open');
+    renderFloatLogs();
+  } else {
+    panel.classList.remove('open');
+  }
+}
+
+async function clearFloatLogs() {
+  await api('DELETE', '/api/debug/logs').catch(() => {});
+  renderFloatLogs();
+}
+
+async function clearServerLogs() {
+  await api('DELETE', '/api/debug/logs').catch(() => {});
+  renderSettingsLogs();
+  toast('Logs cleared', 'warn');
+}
+
+async function forceGC() {
+  try {
+    const r = await api('POST', '/api/debug/gc');
+    toast(`GC done — ${r.collected} objects, freed ~${r.freed_mb}MB`, 'success');
+    await refreshDebugStats();
+  } catch(e) {
+    toast('GC failed: ' + e.message, 'error');
+  }
+}
+
+// ── BOOT ──────────────────────────────────────────────────────────────────────
+(async function boot() {
+  applyExtMaintenance();
+  try {
+    if (exeIsLsMigrated()) {
+      // This device has already migrated — permanently skip the profile
+      // selector and try to resume (or fall back to the EXE login form).
+      await tryAutoExeLogin();
+    } else {
+      await loadProfileScreen();
+    }
+  } catch(e) {
+    // If something totally unexpected happened, show a retry in the grid
+    const grid = document.getElementById('profile-grid');
+    if (grid) grid.innerHTML = `
+      <div style="grid-column:1/-1;font-family:var(--font-mono);font-size:11px;color:#ff6b6b;padding:16px;text-align:center;">
+        <div>Failed to start: ${esc(e.message)}</div>
+        <button onclick="loadProfileScreen()" style="margin-top:10px;padding:5px 14px;border:1px solid rgba(255,59,59,0.3);border-radius:5px;background:transparent;color:#ff6b6b;cursor:pointer;font-family:var(--font-mono);font-size:10px;">Retry</button>
+      </div>`;
+  }
+})();
+
+</script>
+
+<!-- ── ADD ANOTHER ACCOUNT MODAL ── -->
+<div class="modal-overlay" id="add-another-modal">
+  <div class="modal-box" style="max-width:460px;">
+    <button class="modal-close" onclick="closeAddAnotherModal()">✕</button>
+    <div style="font-family:var(--font-display);font-size:20px;font-weight:800;letter-spacing:3px;margin-bottom:6px;">ADD ANOTHER ACCOUNT</div>
+    <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:2px;margin-bottom:24px;">CHOOSE HOW YOU WANT TO ADD YOUR ACCOUNT</div>
+
+    <!-- Method picker — shown first -->
+    <div id="add-another-picker">
+      <!-- Option 1: Extension -->
+      <div id="add-via-ext-card" onclick="selectAddMethod('extension')"
+        style="padding:16px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;cursor:pointer;transition:border-color .2s;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div style="width:38px;height:38px;border-radius:8px;background:rgba(255,255,255,0.05);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.7)" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          </div>
+          <div style="flex:1;">
+            <div style="font-weight:600;font-size:14px;margin-bottom:3px;">Via Extension <span style="font-family:var(--font-mono);font-size:9px;color:rgba(100,255,160,0.7);letter-spacing:1px;background:rgba(100,255,160,0.08);border:1px solid rgba(100,255,160,0.2);border-radius:4px;padding:1px 6px;margin-left:6px;">RECOMMENDED</span></div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);line-height:1.6;">Log into Roblox in your browser, open the Sentinel extension, and click "+ Add Current Account". No code needed.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Option 2: Manual cookie -->
+      <div id="add-via-cookie-card" onclick="selectAddMethod('cookie')"
+        style="padding:16px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color .2s;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div style="width:38px;height:38px;border-radius:8px;background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.2);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="rgba(240,192,64,0.7)" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </div>
+          <div style="flex:1;">
+            <div style="font-weight:600;font-size:14px;margin-bottom:3px;">Manual Cookie <span style="font-family:var(--font-mono);font-size:9px;color:var(--warn);letter-spacing:1px;background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.2);border-radius:4px;padding:1px 6px;margin-left:6px;">ADVANCED</span></div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);line-height:1.6;">Paste your .ROBLOSECURITY cookie directly. Only use a dedicated bot account — never your main.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Extension flow — shown after picking extension -->
+    <div id="add-another-ext-flow" style="display:none;">
+      <button onclick="backToAddPicker()" style="background:none;border:none;color:var(--text-dimmer);font-family:var(--font-mono);font-size:10px;cursor:pointer;padding:0;margin-bottom:16px;">← Back</button>
+      <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px;">
+        <div style="display:flex;gap:12px;align-items:flex-start;">
+          <div style="width:22px;height:22px;border-radius:50%;border:1px solid rgba(255,255,255,0.25);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:10px;color:rgba(255,255,255,0.6);flex-shrink:0;margin-top:1px;">1</div>
+          <div><div style="font-size:13px;font-weight:600;margin-bottom:2px;">Log into a different Roblox account</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);line-height:1.6;">Open roblox.com and sign into the account you want to add.</div></div>
+        </div>
+        <div style="display:flex;gap:12px;align-items:flex-start;">
+          <div style="width:22px;height:22px;border-radius:50%;border:1px solid rgba(255,255,255,0.25);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:10px;color:rgba(255,255,255,0.6);flex-shrink:0;margin-top:1px;">2</div>
+          <div><div style="font-size:13px;font-weight:600;margin-bottom:2px;">Open the Sentinel extension</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);line-height:1.6;">Click the Sentinel icon in your browser toolbar.</div></div>
+        </div>
+        <div style="display:flex;gap:12px;align-items:flex-start;">
+          <div style="width:22px;height:22px;border-radius:50%;border:1px solid rgba(255,255,255,0.25);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:10px;color:rgba(255,255,255,0.6);flex-shrink:0;margin-top:1px;">3</div>
+          <div><div style="font-size:13px;font-weight:600;margin-bottom:2px;">Click "+ Add Current Roblox Account"</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);line-height:1.6;">The extension sends the cookie here automatically — no code needed.</div></div>
+        </div>
+      </div>
+      <div id="add-another-waiting" style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-bottom:14px;">
+        <div style="width:8px;height:8px;border-radius:50%;background:var(--text-dimmer);animation:pulse-dot 1.5s infinite;flex-shrink:0;" id="add-another-dot"></div>
+        <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);" id="add-another-status-text">Waiting for extension…</span>
+      </div>
+      <div id="add-another-detected" style="display:none;padding:12px 14px;background:rgba(100,255,160,0.04);border:1px solid rgba(100,255,160,0.2);border-radius:8px;margin-bottom:14px;">
+        <div style="font-family:var(--font-mono);font-size:9px;color:rgba(100,255,160,0.7);letter-spacing:2px;margin-bottom:8px;">ACCOUNT DETECTED</div>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div id="add-another-avatar" style="width:34px;height:34px;border-radius:50%;background:var(--surface3);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-family:var(--font-display);font-weight:700;font-size:13px;color:rgba(255,255,255,0.5);overflow:hidden;flex-shrink:0;"></div>
+          <div><div style="font-weight:600;font-size:13px;" id="add-another-name">—</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);" id="add-another-user">—</div></div>
+        </div>
+      </div>
+      <div style="display:flex;gap:10px;">
+        <button class="btn btn-primary" style="flex:1;" id="add-another-done-btn" onclick="confirmAddAnother()" disabled>Confirm &amp; Save Account</button>
+        <button class="btn" onclick="closeAddAnotherModal()">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Manual cookie flow — shown after picking cookie -->
+    <div id="add-another-cookie-flow" style="display:none;">
+      <button onclick="backToAddPicker()" style="background:none;border:none;color:var(--text-dimmer);font-family:var(--font-mono);font-size:10px;cursor:pointer;padding:0;margin-bottom:16px;">← Back</button>
+      <div style="padding:12px 14px;background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.2);border-radius:8px;margin-bottom:14px;">
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--warn);font-weight:700;margin-bottom:4px;">⚠ Security Notice</div>
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);line-height:1.7;">Your cookie grants full access to this Roblox account. Only use a dedicated bot/mod account — never your main account.</div>
+      </div>
+      <label style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;display:block;margin-bottom:6px;">.ROBLOSECURITY Cookie</label>
+      <textarea id="add-another-cookie-input" placeholder="Paste your .ROBLOSECURITY value here..." style="width:100%;min-height:80px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:10px;font-family:var(--font-mono);font-size:10px;word-break:break-all;resize:vertical;outline:none;margin-bottom:12px;"></textarea>
+      <div style="display:flex;gap:10px;">
+        <button class="btn btn-primary" style="flex:1;" id="add-another-cookie-btn" onclick="submitAddAnotherCookie()">Add Account</button>
+        <button class="btn" onclick="closeAddAnotherModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── SAVE ACCOUNT POPUP ── -->
+<div id="save-account-popup">
+  <div class="save-popup-header">
+    <div class="save-popup-avatar" id="save-popup-avatar"></div>
+    <div>
+      <div class="save-popup-title" id="save-popup-name">Roblox Account</div>
+      <div class="save-popup-sub" id="save-popup-username"></div>
+    </div>
+  </div>
+  <div class="save-popup-question">Save this account to your dashboard?<br>You can switch between saved accounts any time.</div>
+  <div class="save-popup-btns">
+    <button class="btn btn-primary" onclick="savePendingAccount()">Yes, Save</button>
+    <button class="btn" onclick="dismissSavePrompt()">No Thanks</button>
+  </div>
+</div>
+<!-- ══════════════════════════════════════════════════
+     SENTINEL ANIMATION ENGINE — optimized
+══════════════════════════════════════════════════ -->
+<script>
+(function() {
+'use strict';
+
+/* ── BOOT SEQUENCE ── */
+const bootMessages = [
+  'LOADING CORE MODULES...',
+  'ESTABLISHING SECURE CONTEXT...',
+  'CONNECTING TO ROBLOX API...',
+  'LOADING PROFILE DATA...',
+  'CALIBRATING MODERATION ENGINE...',
+  'SENTINEL ONLINE.',
+];
+let bootPct = 0, msgIdx = 0;
+const fill    = document.getElementById('boot-progress-fill');
+const statusEl = document.getElementById('boot-status-text');
+const bootLogo = document.getElementById('boot-logo-text');
+const splash   = document.getElementById('boot-splash');
+
+function glitch(el, dur) {
+  el.classList.add('glitching');
+  setTimeout(() => el.classList.remove('glitching'), dur);
+}
+setTimeout(() => glitch(bootLogo, 260), 600);
+setTimeout(() => glitch(bootLogo, 160), 1200);
+
+const bootInterval = setInterval(() => {
+  bootPct += Math.random() * 22 + 8;
+  if (bootPct >= 100) { bootPct = 100; clearInterval(bootInterval); }
+  fill.style.width = bootPct + '%';
+  if (msgIdx < bootMessages.length) statusEl.textContent = bootMessages[msgIdx++];
+}, 160);
+
+setTimeout(() => {
+  fill.style.width = '100%';
+  statusEl.textContent = 'SENTINEL ONLINE.';
+  statusEl.style.color = 'rgba(255,255,255,0.7)';
+  setTimeout(() => {
+    splash.classList.add('fade-out');
+    setTimeout(() => { splash.style.display = 'none'; }, 850);
+  }, 380);
+}, 1400);
+
+/* ── CUSTOM CURSOR ── */
+const dot  = document.getElementById('cursor-dot');
+const ring = document.getElementById('cursor-ring');
+let mx = -100, my = -100, rx = -100, ry = -100;
+
+document.addEventListener('mousemove', e => { mx = e.clientX; my = e.clientY; });
+
+(function animateRing() {
+  rx += (mx - rx) * 0.14;
+  ry += (my - ry) * 0.14;
+  ring.style.left = rx + 'px';
+  ring.style.top  = ry + 'px';
+  dot.style.left  = mx + 'px';
+  dot.style.top   = my + 'px';
+  requestAnimationFrame(animateRing);
+})();
+
+const hoverSel = 'button,a,.btn,.nav-tab,.profile-card,.card,.toggle-sw,.pin-key,.asset-chip,.wl-tab,.history-item';
+document.addEventListener('mouseover', e => { if (e.target.closest(hoverSel)) ring.classList.add('hovering'); }, true);
+document.addEventListener('mouseout',  e => { if (e.target.closest(hoverSel)) ring.classList.remove('hovering'); }, true);
+document.addEventListener('mousedown', () => { dot.style.transform = 'translate(-50%,-50%) scale(0.6)'; });
+document.addEventListener('mouseup',   () => { dot.style.transform = 'translate(-50%,-50%) scale(1)'; });
+
+/* ── GRID GLOW CANVAS — only redraws on mousemove ── */
+const gCanvas = document.getElementById('grid-glow-canvas');
+const gCtx    = gCanvas.getContext('2d');
+const GRID    = 56;
+let gmx = -999, gmy = -999, gridDirty = false;
+
+function resizeGrid() {
+  gCanvas.width  = window.innerWidth;
+  gCanvas.height = window.innerHeight;
+  gridDirty = true;
+}
+resizeGrid();
+window.addEventListener('resize', resizeGrid);
+
+document.addEventListener('mousemove', e => {
+  gmx = e.clientX; gmy = e.clientY; gridDirty = true;
+});
+
+function drawGridGlow() {
+  if (gridDirty) {
+    gridDirty = false;
+    gCtx.clearRect(0, 0, gCanvas.width, gCanvas.height);
+    const radius = 200;
+    // Single radial gradient blob — no per-dot gradients (too expensive)
+    const grad = gCtx.createRadialGradient(gmx, gmy, 0, gmx, gmy, radius);
+    grad.addColorStop(0,   'rgba(255,255,255,0.07)');
+    grad.addColorStop(0.5, 'rgba(255,255,255,0.02)');
+    grad.addColorStop(1,   'rgba(255,255,255,0)');
+    gCtx.fillStyle = grad;
+    gCtx.fillRect(0, 0, gCanvas.width, gCanvas.height);
+
+    // Dot highlights — fixed-size, no per-dot createRadialGradient
+    const r2 = radius * radius;
+    const startX = Math.floor((gmx - radius) / GRID) * GRID;
+    const startY = Math.floor((gmy - radius) / GRID) * GRID;
+    const endX   = Math.ceil((gmx + radius) / GRID) * GRID;
+    const endY   = Math.ceil((gmy + radius) / GRID) * GRID;
+    for (let gx = startX; gx <= endX; gx += GRID) {
+      for (let gy = startY; gy <= endY; gy += GRID) {
+        const dx = gx - gmx, dy = gy - gmy;
+        const d2 = dx*dx + dy*dy;
+        if (d2 < r2) {
+          const strength = Math.pow(1 - Math.sqrt(d2) / radius, 2);
+          gCtx.beginPath();
+          gCtx.arc(gx, gy, 2.5, 0, Math.PI * 2);
+          gCtx.fillStyle = `rgba(255,255,255,${(strength * 0.7).toFixed(3)})`;
+          gCtx.fill();
+        }
+      }
+    }
+  }
+  requestAnimationFrame(drawGridGlow);
+}
+requestAnimationFrame(drawGridGlow);
+
+/* ── PARTICLES — no connection lines, GPU-friendly ── */
+const pCanvas = document.getElementById('particle-canvas');
+const pCtx    = pCanvas.getContext('2d');
+
+function resizeParticles() {
+  pCanvas.width  = window.innerWidth;
+  pCanvas.height = window.innerHeight;
+}
+resizeParticles();
+window.addEventListener('resize', resizeParticles);
+
+const PARTICLE_COUNT = 28; // reduced count, no O(n²) lines
+const particles = Array.from({ length: PARTICLE_COUNT }, () => ({
+  x: Math.random() * window.innerWidth,
+  y: Math.random() * window.innerHeight,
+  vx: (Math.random() - 0.5) * 0.2,
+  vy: (Math.random() - 0.5) * 0.2,
+  size: Math.random() * 1.2 + 0.4,
+  alpha: Math.random() * 0.3 + 0.05,
+  phase: Math.random() * Math.PI * 2,
+}));
+
+let lastParticleFrame = 0;
+function drawParticles(ts) {
+  // Throttle to ~30fps for particles — plenty smooth, way cheaper
+  if (ts - lastParticleFrame < 33) { requestAnimationFrame(drawParticles); return; }
+  lastParticleFrame = ts;
+  pCtx.clearRect(0, 0, pCanvas.width, pCanvas.height);
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.phase += 0.008;
+    if (p.x < -5) p.x = pCanvas.width + 5;
+    if (p.x > pCanvas.width + 5) p.x = -5;
+    if (p.y < -5) p.y = pCanvas.height + 5;
+    if (p.y > pCanvas.height + 5) p.y = -5;
+    const a = p.alpha * (0.75 + 0.25 * Math.sin(p.phase));
+    pCtx.beginPath();
+    pCtx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    pCtx.fillStyle = `rgba(255,255,255,${a.toFixed(3)})`;
+    pCtx.fill();
+  }
+  requestAnimationFrame(drawParticles);
+}
+requestAnimationFrame(drawParticles);
+
+/* ── BUTTON RIPPLE ── */
+document.addEventListener('click', e => {
+  const btn = e.target.closest('.btn,.pin-key,.nav-tab');
+  if (!btn) return;
+  const rect = btn.getBoundingClientRect();
+  const size = Math.max(rect.width, rect.height) * 1.5;
+  const r = document.createElement('span');
+  r.className = 'btn-ripple';
+  r.style.cssText = `width:${size}px;height:${size}px;left:${e.clientX-rect.left-size/2}px;top:${e.clientY-rect.top-size/2}px;`;
+  btn.appendChild(r);
+  setTimeout(() => r.remove(), 600);
+}, true);
+
+/* ── CARD 3D TILT — only on the hovered card, not all cards ── */
+let tiltTarget = null;
+document.addEventListener('mouseover', e => {
+  tiltTarget = e.target.closest('.card,.stat-card');
+}, true);
+document.addEventListener('mousemove', e => {
+  if (!tiltTarget) return;
+  const rect = tiltTarget.getBoundingClientRect();
+  const dx = (e.clientX - (rect.left + rect.width/2))  / (rect.width/2);
+  const dy = (e.clientY - (rect.top  + rect.height/2)) / (rect.height/2);
+  tiltTarget.style.transform = `perspective(700px) rotateX(${-dy*4}deg) rotateY(${dx*4}deg) translateY(-2px)`;
+});
+document.addEventListener('mouseout', e => {
+  const left = e.target.closest('.card,.stat-card');
+  if (left) { left.style.transform = ''; tiltTarget = null; }
+}, true);
+
+/* ── NAV INDICATOR ── */
+function updateNavIndicator(tabName) {
+  const indicator = document.getElementById('nav-indicator');
+  if (!indicator) return;
+  const btn = tabName
+    ? document.querySelector(`.nav-tab[onclick*="${tabName}"]`)
+    : document.querySelector('.nav-tab.active');
+  if (!btn) return;
+  const navRect = document.getElementById('nav').getBoundingClientRect();
+  const btnRect = btn.getBoundingClientRect();
+  indicator.style.left  = (btnRect.left - navRect.left) + 'px';
+  indicator.style.width = btnRect.width + 'px';
+}
+setTimeout(() => updateNavIndicator(''), 400);
+
+/* ── PATCH showTab FOR TRANSITIONS + INDICATOR ── */
+const _orig = window.showTab;
+window.showTab = function(tab) {
+  const prev = document.querySelector('.tab-panel.active');
+  if (prev && !prev.id.includes(tab)) {
+    prev.classList.add('tab-exit');
+    setTimeout(() => prev.classList.remove('tab-exit'), 260);
+  }
+  if (_orig) _orig.call(window, tab);
+  const panel = document.getElementById('tab-' + tab);
+  if (panel) {
+    panel.classList.remove('tab-enter');
+    void panel.offsetWidth;
+    panel.classList.add('tab-enter');
+    setTimeout(() => panel.classList.remove('tab-enter'), 350);
+  }
+  setTimeout(() => updateNavIndicator(tab), 20);
+};
+
+/* ── PROFILE CARD STAGGER ── */
+function animateProfileCards() {
+  document.querySelectorAll('#profile-grid .profile-card').forEach((c, i) => {
+    c.style.animationDelay = (0.08 + i * 0.07) + 's';
+  });
+}
+const profileGrid = document.getElementById('profile-grid');
+if (profileGrid) new MutationObserver(animateProfileCards).observe(profileGrid, { childList: true });
+animateProfileCards();
+
+/* ── PERIODIC LOGO GLITCH ── */
+function scheduleGlitch(el) {
+  if (!el) return;
+  setTimeout(() => {
+    glitch(el, 160 + Math.random() * 100);
+    setTimeout(() => glitch(el, 90), 220);
+    scheduleGlitch(el);
+  }, 5000 + Math.random() * 9000);
+}
+scheduleGlitch(document.querySelector('.big-logo'));
+
+/* ── CORNER PULSE ── */
+function pulseCorners() {
+  document.querySelectorAll('.corner-decor').forEach(c => {
+    c.classList.add('corner-decor-pulse');
+    setTimeout(() => c.classList.remove('corner-decor-pulse'), 400);
+  });
+  setTimeout(pulseCorners, 7000 + Math.random() * 4000);
+}
+setTimeout(pulseCorners, 3500);
+
+/* ── WELCOME TOAST ── */
+window._sentinelShowWelcome = function(profileName) {
+  const wt = document.getElementById('welcome-toast');
+  const nameEl = document.getElementById('welcome-toast-name');
+  if (!wt) return;
+  nameEl.textContent = profileName ? `WELCOME BACK, ${profileName.toUpperCase()}` : 'WELCOME BACK';
+  wt.classList.add('show');
+  setTimeout(() => wt.classList.remove('show'), 3200);
+};
+
+/* ── STAT COUNT-UP ── */
+function animateCounter(el, target) {
+  const from = parseInt(el.textContent) || 0;
+  if (from === target) return;
+  const dur = 800, start = performance.now(), diff = target - from;
+  function step(now) {
+    const t = Math.min((now - start) / dur, 1);
+    el.textContent = Math.round(from + diff * (1 - Math.pow(1 - t, 3)));
+    if (t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+['stat-archived','stat-groups','stat-whitelisted'].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  new MutationObserver(() => {
+    const v = parseInt(el.textContent);
+    if (!isNaN(v)) animateCounter(el, v);
+  }).observe(el, { childList: true, characterData: true, subtree: true });
+});
+
+})();
+</script>
+<!-- ══════════════════════════════════════════════════
+     VAULT JS — Ctrl+Shift+B, works everywhere
+══════════════════════════════════════════════════ -->
+<script>
+(function() {
+
+const overlay = document.getElementById('vault-overlay');
+const keyInput = document.getElementById('vault-key-input');
+const logEl    = document.getElementById('vault-log');
+const logInner = document.getElementById('vault-log-inner');
+
+// ── Open / close ──────────────────────────────────────────────────────────────
+window.vaultOpen = function() {
+  overlay.style.display = 'flex';
+  // Restore saved key from sessionStorage
+  const saved = sessionStorage.getItem('_vaultKey');
+  if (saved) keyInput.value = saved;
+  setTimeout(() => keyInput.focus(), 80);
+};
+
+window.vaultClose = function() {
+  overlay.style.display = 'none';
+  vaultLogClear();
+};
+
+// Ctrl+Shift+B anywhere
+document.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.shiftKey && e.code === 'KeyB') {
+    e.preventDefault();
+    overlay.style.display === 'none' ? vaultOpen() : vaultClose();
+  }
+  if (e.key === 'Escape' && overlay.style.display !== 'none') vaultClose();
+});
+
+// Click backdrop to close
+overlay.addEventListener('click', function(e) {
+  if (e.target === overlay) vaultClose();
+});
+
+// ── Log helpers ───────────────────────────────────────────────────────────────
+function vaultLog(msg, color) {
+  logEl.style.display = 'block';
+  const line = document.createElement('div');
+  line.style.color = color || 'rgba(255,255,255,0.55)';
+  line.textContent = '› ' + msg;
+  logInner.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function vaultLogClear() {
+  logInner.innerHTML = '';
+  logEl.style.display = 'none';
+}
+function vaultLogOk(msg)   { vaultLog(msg, '#4ade80'); }
+function vaultLogErr(msg)  { vaultLog(msg, '#f87171'); }
+function vaultLogInfo(msg) { vaultLog(msg, 'rgba(255,255,255,0.45)'); }
+
+// ── Toggle key visibility ─────────────────────────────────────────────────────
+window.vaultToggleKeyVis = function() {
+  keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
+};
+
+// ── Get + cache key ───────────────────────────────────────────────────────────
+function getKey() {
+  const k = keyInput.value.trim();
+  if (!k) { vaultLogErr('Enter the master key first'); return null; }
+  sessionStorage.setItem('_vaultKey', k); // cache for the session
+  return k;
+}
+
+// ── EXPORT ────────────────────────────────────────────────────────────────────
+window.vaultExport = async function() {
+  const key = getKey(); if (!key) return;
+  vaultLogClear();
+  vaultLogInfo('Connecting to server...');
+  const btn = document.getElementById('vault-btn-export');
+  btn.textContent = '⏳ EXPORTING...'; btn.style.opacity = '0.6';
+
+  try {
+    const res = await fetch(BASE_PATH + '/api/vault/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      vaultLogErr(`Server error ${res.status}: ${err.detail || res.statusText}`);
+      return;
+    }
+    const data = await res.json();
+
+    // Table summary
+    const meta   = data._meta || {};
+    const tables = Object.keys(data).filter(k => k !== '_meta');
+    const total  = tables.reduce((s, t) => s + (Array.isArray(data[t]) ? data[t].length : 0), 0);
+    vaultLogOk(`Export received — ${total} total rows`);
+    tables.forEach(t => {
+      const n = Array.isArray(data[t]) ? data[t].length : 0;
+      vaultLogInfo(`  ${t}: ${n} rows`);
+    });
+
+    // Download
+    const ts       = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    const filename = `sentinel-vault-${ts}.json`;
+    const blob     = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url      = URL.createObjectURL(blob);
+    const a        = Object.assign(document.createElement('a'), { href: url, download: filename });
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    vaultLogOk(`✓ Saved as ${filename}`);
+    vaultLogInfo('Keep this file safe — it contains all your Sentinel data including cookies.');
+  } catch(e) {
+    vaultLogErr('Network error: ' + e.message);
+  } finally {
+    btn.textContent = '⬇ EXPORT BACKUP'; btn.style.opacity = '1';
+  }
+};
+
+// ── IMPORT ────────────────────────────────────────────────────────────────────
+window.vaultImport = async function(input) {
+  const key = getKey(); if (!key) { input.value = ''; return; }
+  const file = input.files[0]; if (!file) return;
+
+  vaultLogClear();
+  vaultLogInfo(`Reading ${file.name}...`);
+
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch(e) {
+    vaultLogErr('Invalid JSON — is this a Sentinel vault file?');
+    input.value = ''; return;
+  }
+
+  if (!parsed || typeof parsed !== 'object' || !parsed._meta) {
+    vaultLogErr('Not a valid Sentinel vault file (missing _meta)');
+    input.value = ''; return;
+  }
+
+  const tables = Object.keys(parsed).filter(k => k !== '_meta');
+  const total  = tables.reduce((s, t) => s + (Array.isArray(parsed[t]) ? parsed[t].length : 0), 0);
+  const exportedAt = parsed._meta.exported_at || 'unknown time';
+
+  vaultLogInfo(`File: ${file.name}`);
+  vaultLogInfo(`Exported: ${exportedAt}`);
+  vaultLogInfo(`Tables: ${tables.join(', ')}`);
+  vaultLogInfo(`Total rows: ${total}`);
+
+  const ok = confirm(
+    `SENTINEL VAULT IMPORT\n\n` +
+    `File: ${file.name}\n` +
+    `Exported: ${exportedAt}\n` +
+    `Rows: ${total} across ${tables.length} tables\n\n` +
+    `Existing rows with matching IDs will be OVERWRITTEN.\n` +
+    `Rows NOT in this file will be left untouched.\n\n` +
+    `Continue?`
+  );
+  if (!ok) { vaultLogInfo('Import cancelled.'); input.value = ''; return; }
+
+  vaultLogInfo('Uploading to server...');
+  const lbl = document.getElementById('vault-btn-import');
+  lbl.textContent = '⏳ IMPORTING...'; lbl.style.opacity = '0.6';
+
+  try {
+    const res = await fetch(BASE_PATH + '/api/vault/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, data: parsed }),
+    });
+    const result = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      vaultLogErr(`Server error ${res.status}: ${result.detail || res.statusText}`);
+      return;
     }
 
-@app.post("/api/sanity-check/run")
-async def api_trigger_sanity_check():
-    """Manually trigger a sanity check (non-blocking — fires and returns immediately)."""
-    asyncio.create_task(run_sanity_check())
-    return {"triggered": True}
+    vaultLogOk('✓ Import complete!');
+    const tbl = result.tables || {};
+    Object.entries(tbl).forEach(([t, n]) => vaultLogInfo(`  ${t}: ${n} rows upserted`));
+    vaultLogInfo('Reload the page to log in with your restored profiles.');
+    vaultLogOk('→ Refresh the page now');
+  } catch(e) {
+    vaultLogErr('Network error: ' + e.message);
+  } finally {
+    lbl.innerHTML = '⬆ IMPORT BACKUP<input type="file" id="vault-file-input" accept=".json,application/json" style="display:none" onchange="vaultImport(this)">';
+    lbl.style.opacity = '1';
+    input.value = '';
+  }
+};
 
-class ValidateCookieBody(BaseModel):
-    cookie: str
+})();
 
-@app.post("/api/validate-cookie")
-async def api_validate_cookie(body: ValidateCookieBody):
-    """Validate a Roblox cookie and return account info. Used by extension during account scanning."""
-    try:
-        info = await validate_cookie(body.cookie)
-        return info
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"Invalid cookie: {e}")
+/* ── MIGRATION NOTICE POPUP ── */
+function dismissMigrationPopup() {
+  document.getElementById('migration-popup').classList.add('hidden');
+  try { localStorage.setItem('sentinel_migration_notice_v1', '1'); } catch(_) {}
+}
 
-@app.get("/api/asset-types")
-def api_asset_types():
-    return ALL_ASSET_TYPES
-
-# ── DEBUG ROUTES ──────────────────────────────────────────────────────────────
-
-@app.get("/api/debug/logs")
-def api_debug_logs(limit: int = 200, level: str = "", source: str = ""):
-    logs = list(_LOG_BUFFER)
-    if level:
-        logs = [l for l in logs if l["level"] == level.upper()]
-    if source:
-        logs = [l for l in logs if l["source"] == source.upper()]
-    return list(reversed(logs))[-limit:]
-
-@app.get("/api/debug/memory")
-def api_debug_memory():
-    process = psutil.Process()
-    mem     = process.memory_info()
-    cpu     = psutil.cpu_percent(interval=None)
-    vm      = psutil.virtual_memory()
-    return {
-        "rss_mb":       round(mem.rss / 1024 / 1024, 2),
-        "vms_mb":       round(mem.vms / 1024 / 1024, 2),
-        "pct":          _MEMORY_PCT,
-        "limit_mb":     float(os.environ.get("MEMORY_LIMIT_MB", 400)),
-        "total_mb":     round(vm.total / 1024 / 1024, 2),
-        "available_mb": round(vm.available / 1024 / 1024, 2),
-        "sys_pct":      vm.percent,
-        "cpu_pct":      cpu,
-        "degraded":     _DEGRADED,
-        "sessions":     len(_sessions),
-        "log_count":    len(_LOG_BUFFER),
+(function() {
+  try {
+    if (!localStorage.getItem('sentinel_migration_notice_v1')) {
+      document.getElementById('migration-popup').classList.remove('hidden');
     }
+  } catch(_) {}
+})();
 
-@app.post("/api/debug/gc")
-def api_debug_gc():
-    before = psutil.Process().memory_info().rss / 1024 / 1024
-    collected = gc.collect()
-    _trim_memory()
-    after  = psutil.Process().memory_info().rss / 1024 / 1024
-    freed  = round(before - after, 2)
-    sentinel_log(f"Manual GC+trim: collected {collected} objects, freed ~{freed}MB", "MEMORY", "DEBUG")
-    return {"collected": collected, "freed_mb": freed, "rss_after_mb": round(after, 2)}
-
-@app.delete("/api/debug/logs")
-def api_clear_logs():
-    _LOG_BUFFER.clear()
-    sentinel_log("Log buffer cleared", "INFO", "DEBUG")
-    return {"cleared": True}
-
-@app.get("/api/debug/sessions")
-def api_debug_sessions():
-    result = []
-    for pid_key, sess in _sessions.items():
-        result.append({
-            "profile_id":    pid_key,
-            "monitoring":    sess.monitoring,
-            "has_cookie":    bool(sess.cookie),
-            "known_groups":  len(sess.known_assets),
-            "known_assets":  sum(len(v) for v in sess.known_assets.values()),
-            "has_task":      sess.monitor_task is not None and not sess.monitor_task.done(),
-        })
-    return result
-
-# ── SERVE FRONTEND ────────────────────────────────────────────────────────────
-
-BASE_DIR   = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-
-MOBILE_AGENTS = ("android","iphone","ipad","ipod","mobile","opera mini","blackberry","windows phone")
-
-@app.get("/", response_class=HTMLResponse)
-def serve_root(request: Request):
-    ua = request.headers.get("user-agent", "").lower()
-    if any(t in ua for t in MOBILE_AGENTS):
-        mp = STATIC_DIR / "sentinel_mobile.html"
-        if mp.exists(): return HTMLResponse(mp.read_text(), 200)
-    p = STATIC_DIR / "index.html"
-    return HTMLResponse(p.read_text() if p.exists() else "<h1>Frontend missing</h1>", 200)
-
-@app.get("/uploader", response_class=HTMLResponse)
-def serve_uploader(request: Request):
-    ua = request.headers.get("user-agent", "").lower()
-    is_mobile = any(t in ua for t in MOBILE_AGENTS)
-    fname = "sentinel_uploader.html" if is_mobile else "sentinel_uploader_desktop.html"
-    p = STATIC_DIR / fname
-    return HTMLResponse(p.read_text() if p.exists() else "<h1>Uploader missing</h1>", 200)
-
-
-
-@app.post("/api/upload-asset")
-async def upload_asset(
-    file: UploadFile = File(...),
-    profile_id: str = None,
-):
-    if not profile_id:
-        raise HTTPException(400, "profile_id required")
-    session = _sessions.get(profile_id)
-    if not session or not session.cookie:
-        raise HTTPException(403, "No active Roblox account for this profile")
-    cookie = session.cookie
-    csrf = await get_csrf(cookie)
-    data = await file.read()
-    fname = file.filename or "upload.mp3"
-    ctype = file.content_type or "audio/mpeg"
-    url = "https://data.roblox.com/Data/Upload.ashx"
-    params = {"assetTypeId": 3, "name": fname, "description": "", "ispublic": "false", "allowComments": "false", "groupId": ""}
-    async with httpx.AsyncClient(timeout=30) as c:
-        hdrs = {"Content-Type": ctype, "User-Agent": "Roblox/WinInet", "X-CSRF-TOKEN": csrf}
-        r = await c.post(url, content=data, params=params, headers=hdrs, cookies={".ROBLOSECURITY": cookie})
-        if r.status_code == 403:
-            nc = r.headers.get("x-csrf-token")
-            if nc:
-                hdrs["X-CSRF-TOKEN"] = nc
-                r = await c.post(url, content=data, params=params, headers=hdrs, cookies={".ROBLOSECURITY": cookie})
-        if r.status_code not in (200, 201):
-            raise HTTPException(502, f"Roblox upload failed: {r.status_code}")
-    asset_id = r.text.strip()
-    if not asset_id.isdigit():
-        raise HTTPException(502, f"Unexpected Roblox response: {asset_id[:80]}")
-    return {"asset_id": asset_id, "filename": fname}
-
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+</script>
+</body>
+</html>
