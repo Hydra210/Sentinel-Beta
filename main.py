@@ -14,7 +14,6 @@ import httpx
 import psutil
 import psycopg2
 import psycopg2.extras
-import jwt as pyjwt
 from psycopg2 import pool as pg_pool
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,29 +41,6 @@ ALL_ASSET_TYPES = [
 # Note: "Image" is excluded — Roblox does not allow archiving images via API.
 # Images are system-generated from Decal uploads and cannot be archived.
 NON_ARCHIVABLE_TYPES = {"Image"}
-
-# ── EXE ACCOUNT SYSTEM (migration target — see exe-accounts-api) ──────────────
-# EXE_JWT_SECRET must be the EXACT same value as JWT_SECRET on the exe-accounts-api
-# service — that's what lets Sentinel verify EXE access tokens locally with zero
-# network calls (Option A in that service's README).
-EXE_JWT_SECRET = os.environ.get("EXE_JWT_SECRET", "")
-EXE_JWT_ALGO   = "HS256"
-# EXE_API_URL is only used for the couple of calls Sentinel's *backend* makes to
-# the EXE service directly (forcing 2FA on for accounts created via Sentinel).
-# Everything else (register/login/refresh/logout) is called by the frontend
-# straight against the EXE API — see EXE_API_BASE in index.html.
-EXE_API_URL = os.environ.get("EXE_API_URL", "").rstrip("/")
-
-def decode_exe_access_token(token: str) -> dict:
-    """Verify an EXE Account access token locally (shared-secret / Option A)."""
-    if not EXE_JWT_SECRET:
-        raise HTTPException(503, "EXE_JWT_SECRET is not configured on this server")
-    try:
-        return pyjwt.decode(token, EXE_JWT_SECRET, algorithms=[EXE_JWT_ALGO])
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(401, "EXE access token expired")
-    except pyjwt.InvalidTokenError:
-        raise HTTPException(401, "Invalid EXE access token")
 
 # ── SQLITE (local data — groups, history, config) ─────────────────────────────
 
@@ -241,14 +217,6 @@ def init_pg():
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS pin_length INTEGER DEFAULT 4",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE",
-            # EXE Account migration — a profile with migrated=TRUE is owned by an
-            # EXE Account (exe_user_id) instead of a PIN. Its pin_hash is a random,
-            # unusable value once migrated — login only works via a valid EXE
-            # access token from here on, and it's excluded from the PIN selector.
-            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS migrated BOOLEAN DEFAULT FALSE",
-            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS exe_user_id TEXT DEFAULT ''",
-            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS exe_email TEXT DEFAULT ''",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_exe_user_id ON profiles(exe_user_id) WHERE exe_user_id != ''",
         ]:
             try:
                 cur2.execute(migration_sql + ";")
@@ -1731,14 +1699,6 @@ class ProfileLogin(BaseModel):
     profile_id: str
     pin:        str
 
-class ExeMigrateBody(BaseModel):
-    profile_id:   str   # the Sentinel profile being migrated
-    pin:          str   # proves ownership of that profile, same as any other profile action
-    access_token: str   # fresh EXE Account access token from /auth/register+login or /auth/login
-
-class ExeLoginBody(BaseModel):
-    access_token: str   # EXE Account access token — used to resume an already-migrated profile
-
 class ProfileUpdate(BaseModel):
     profile_id: str
     pin:        str
@@ -1821,9 +1781,7 @@ def api_list_profiles():
     conn = get_pg(); cur = conn.cursor()
     try:
         try:
-            # Migrated profiles are owned by an EXE Account now — they no longer
-            # show up in the PIN selector at all, migrated or not recoverable here.
-            cur.execute("SELECT id, name, avatar_url, created_at, pin_length, is_admin FROM profiles WHERE migrated IS NOT TRUE ORDER BY created_at")
+            cur.execute("SELECT id, name, avatar_url, created_at, pin_length, is_admin FROM profiles ORDER BY created_at")
         except Exception:
             conn.rollback()
             cur.execute("SELECT id, name, avatar_url, created_at FROM profiles ORDER BY created_at")
@@ -1887,16 +1845,12 @@ def api_login_profile(body: ProfileLogin):
     cur  = conn.cursor()
     try:
         cur.execute(
-            "SELECT id, name, avatar_url, migrated FROM profiles WHERE id=%s AND pin_hash=%s",
+            "SELECT id, name, avatar_url FROM profiles WHERE id=%s AND pin_hash=%s",
             (body.profile_id, hash_pin(body.pin))
         )
         row = cur.fetchone()
         if not row:
             raise HTTPException(401, "Invalid PIN")
-        if row.get("migrated"):
-            # Shouldn't normally be reachable — migrated profiles are hidden
-            # from /api/profiles — but guard it anyway in case of a stale client.
-            raise HTTPException(403, "This profile has been migrated to an EXE Account. Log in with your EXE Account instead.")
 
         saved_cookie  = None
         saved_account = None
@@ -2012,182 +1966,6 @@ def api_delete_profile(profile_id: str, pin: str):
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-# ── EXE ACCOUNT MIGRATION ─────────────────────────────────────────────────────
-# Sentinel is moving off its own PIN/profile system onto the shared EXE Account
-# system. These two routes are the bridge: /api/exe/migrate takes an existing
-# PIN-based profile and permanently hands it over to an EXE Account (all of its
-# data — groups, history, config, saved Roblox credentials — is repointed to
-# the EXE user id and the old PIN profile row is deleted). /api/exe/login is
-# what a *returning* migrated user calls — no PIN involved at all, just a
-# valid EXE access token.
-
-def _exe_profile_row_shape(row: dict) -> dict:
-    """Same response shape /api/profiles/login returns, so the frontend can
-    feed either straight into loginToProfile() without special-casing."""
-    return {
-        "id":         row["id"],
-        "name":       row["name"],
-        "avatar_url": row["avatar_url"],
-        "is_admin":   row.get("is_admin", False),
-        "migrated":   True,
-        "exe_email":  row.get("exe_email", ""),
-    }
-
-def _exe_load_saved_accounts(cur, profile_id: str) -> dict:
-    saved_cookie, saved_account, saved_accounts_list = None, None, []
-    cur.execute(
-        "SELECT roblox_user_id, cookie_encrypted, account_info FROM saved_credentials WHERE profile_id=%s ORDER BY saved_at DESC",
-        (profile_id,)
-    )
-    creds = cur.fetchall()
-    if creds:
-        saved_cookie  = creds[0]["cookie_encrypted"]
-        saved_account = creds[0]["account_info"]
-        for c in creds:
-            info_entry = c["account_info"]
-            if isinstance(info_entry, str):
-                try: info_entry = json.loads(info_entry)
-                except: info_entry = {}
-            if info_entry:
-                saved_accounts_list.append(info_entry)
-    return {"hasCredential": bool(saved_cookie), "account": saved_account, "savedAccounts": saved_accounts_list}
-
-async def _exe_force_2fa_on(access_token: str):
-    """Sentinel enforces 2SV on every EXE Account it creates — there's no way to
-    turn it off from Sentinel's own UI, only from the EXE homepage later. Best
-    effort: if this call fails for any reason (EXE_API_URL unset, network
-    hiccup) migration still proceeds — we don't want a 2FA housekeeping call
-    to block someone from getting into their own data."""
-    if not EXE_API_URL:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"{EXE_API_URL}/auth/2fa/toggle",
-                json={"enabled": True},
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-    except Exception as e:
-        print(f"[SENTINEL] Could not force-enable 2SV on migration: {e}")
-
-@app.post("/api/exe/migrate")
-async def api_exe_migrate(body: ExeMigrateBody):
-    """Migrate a PIN-based Sentinel profile to an EXE Account, permanently."""
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    payload = decode_exe_access_token(body.access_token)
-    exe_user_id = payload.get("sub")
-    exe_email   = payload.get("email", "")
-    if not exe_user_id:
-        raise HTTPException(401, "Invalid EXE access token")
-
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id, name, avatar_url, pin_length, is_admin, migrated FROM profiles WHERE id=%s AND pin_hash=%s",
-            (body.profile_id, hash_pin(body.pin))
-        )
-        old = cur.fetchone()
-        if not old:
-            raise HTTPException(401, "Invalid PIN")
-        if old.get("migrated"):
-            raise HTTPException(409, "This profile has already been migrated")
-
-        new_id = f"exe:{exe_user_id}"
-
-        # 1) Create (or update) the profile row that will own this data from now
-        #    on — its id is derived from the EXE user, not a PIN. pin_hash is set
-        #    to an unusable random value since PIN login is over for this row.
-        cur.execute("""
-            INSERT INTO profiles (id, name, pin_hash, avatar_url, pin_length, is_admin, migrated, exe_user_id, exe_email)
-            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)
-            ON CONFLICT (id) DO UPDATE SET
-                name=EXCLUDED.name, avatar_url=EXCLUDED.avatar_url, exe_email=EXCLUDED.exe_email
-        """, (new_id, old["name"], hash_pin(secrets.token_hex(16)), old["avatar_url"],
-              old.get("pin_length", 4), old.get("is_admin", False), exe_user_id, exe_email))
-
-        # 2) Repoint every table keyed by profile_id over to the new id.
-        for table in ("saved_credentials", "groups", "history", "config", "connect_codes"):
-            cur.execute(f"UPDATE {table} SET profile_id=%s WHERE profile_id=%s", (new_id, body.profile_id))
-
-        # 3) Delete the old PIN profile row — the migration is one-way.
-        cur.execute("DELETE FROM profiles WHERE id=%s", (body.profile_id,))
-        conn.commit()
-
-        # Carry in-memory session state (active monitoring, cookie, etc.) over
-        # to the new id too, so nothing has to reconnect right after migrating.
-        if body.profile_id in _sessions:
-            sess = _sessions.pop(body.profile_id)
-            sess.profile_id = new_id
-            _sessions[new_id] = sess
-
-        extra = _exe_load_saved_accounts(cur, new_id)
-        result = _exe_profile_row_shape({
-            "id": new_id, "name": old["name"], "avatar_url": old["avatar_url"],
-            "is_admin": old.get("is_admin", False), "exe_email": exe_email,
-        })
-        result.update(extra)
-
-        await _exe_force_2fa_on(body.access_token)
-
-        sentinel_log(f"Profile {body.profile_id[:8]} migrated to EXE Account {exe_user_id[:8]}", "INFO", "EXE")
-        return result
-    except HTTPException:
-        conn.rollback(); raise
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
-    finally:
-        cur.close(); release_pg(conn)
-
-@app.post("/api/exe/login")
-def api_exe_login(body: ExeLoginBody):
-    """Resume a session for a profile that was already migrated to an EXE
-    Account. No PIN involved — the access token alone proves identity. If this
-    EXE Account has never migrated (or created) a Sentinel profile before, a
-    fresh empty one is provisioned automatically — every EXE Account gets one
-    Sentinel profile the moment it first logs in here."""
-    if not PG_URL:
-        raise HTTPException(503, "Postgres not configured")
-    payload = decode_exe_access_token(body.access_token)
-    exe_user_id = payload.get("sub")
-    exe_email   = payload.get("email", "")
-    if not exe_user_id:
-        raise HTTPException(401, "Invalid EXE access token")
-
-    conn = get_pg(); cur = conn.cursor()
-    try:
-        new_id = f"exe:{exe_user_id}"
-        cur.execute("SELECT id, name, avatar_url, is_admin, exe_email FROM profiles WHERE id=%s", (new_id,))
-        row = cur.fetchone()
-        if not row:
-            # First time this EXE Account has ever touched Sentinel — provision
-            # a blank profile for it rather than erroring out.
-            display_name = (payload.get("email") or "EXE Account").split("@")[0]
-            cur.execute("""
-                INSERT INTO profiles (id, name, pin_hash, avatar_url, pin_length, is_admin, migrated, exe_user_id, exe_email)
-                VALUES (%s, %s, %s, '', 4, FALSE, TRUE, %s, %s)
-            """, (new_id, display_name, hash_pin(secrets.token_hex(16)), exe_user_id, exe_email))
-            conn.commit()
-            cur.execute("SELECT id, name, avatar_url, is_admin, exe_email FROM profiles WHERE id=%s", (new_id,))
-            row = cur.fetchone()
-
-        cfg_check = get_config(new_id)
-        session = get_session(new_id)
-        if cfg_check.get("_monitoringActive") and not session.monitoring:
-            session.monitoring   = True
-            session.monitor_task = asyncio.create_task(monitor_loop(new_id))
-
-        extra = _exe_load_saved_accounts(cur, new_id)
-        result = _exe_profile_row_shape(dict(row))
-        result.update(extra)
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
     finally:
         cur.close(); release_pg(conn)
 
