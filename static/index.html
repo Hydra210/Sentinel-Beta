@@ -127,7 +127,7 @@
 
   /* ── INPUTS ── */
   .field-label { font-family: var(--font-mono); font-size: 10px; letter-spacing: 2px; color: var(--text-dimmer); text-transform: uppercase; margin-bottom: 8px; display: block; }
-  input[type="text"], input[type="password"], input[type="url"], input[type="number"], textarea, select { width: 100%; background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; font-family: var(--font-mono); font-size: 12px; transition: all 0.2s; outline: none; appearance: none; border-radius: 6px; }
+  input[type="text"], input[type="password"], input[type="url"], input[type="number"], input[type="email"], textarea, select { width: 100%; background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; font-family: var(--font-mono); font-size: 12px; transition: all 0.2s; outline: none; appearance: none; border-radius: 6px; }
   input:focus, textarea:focus, select:focus { border-color: rgba(255,255,255,0.3); background: rgba(255,255,255,0.06); }
   textarea { resize: vertical; min-height: 90px; }
   select option { background: var(--surface2); color: var(--text); }
@@ -309,6 +309,14 @@
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 500; display: none; align-items: center; justify-content: center; padding: 20px; }
   .modal-overlay.open { display: flex; }
   .modal-box { background: var(--surface); border: 1px solid rgba(255,255,255,0.14); padding: 32px; width: 100%; max-width: 520px; max-height: 85vh; overflow-y: auto; position: relative; border-radius: 14px; box-shadow: 0 24px 80px rgba(0,0,0,0.7); animation: fadeIn 0.2s ease; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
+  .modal-box-lg { max-width: 760px; max-height: 82vh; display: flex; flex-direction: column; }
+  .settings-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; flex-wrap: wrap; }
+  .settings-tab-btn { padding: 9px 16px; font-family: var(--font-display); font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-dimmer); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; }
+  .settings-tab-btn:hover { color: var(--text-dim); }
+  .settings-tab-btn.active { color: #fff; border-bottom-color: #fff; }
+  .settings-tab-body { overflow-y: auto; flex: 1; padding-right: 4px; }
+  .settings-tab-panel { display: none; }
+  .settings-tab-panel.active { display: block; }
   .modal-close { position: absolute; top: 16px; right: 16px; background: none; border: 1px solid var(--border); color: var(--text-dim); width: 28px; height: 28px; cursor: pointer; font-size: 14px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; border-radius: 6px; z-index: 10; }
   .modal-close:hover { border-color: rgba(255,59,59,0.4); color: #ff6b6b; }
 
@@ -319,6 +327,18 @@
     flex-direction: column; padding: 40px 20px;
   }
   #profile-screen.hidden { display: none; }
+
+  #exe-screen {
+    position: fixed; inset: 0; z-index: 210;
+    background: var(--bg); display: flex; align-items: center; justify-content: center;
+    flex-direction: column; padding: 40px 20px;
+  }
+  #exe-screen.hidden { display: none; }
+  #exe-screen-box {
+    width: 100%; max-width: 380px;
+    background: var(--surface); border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 14px; padding: 32px; box-shadow: 0 24px 80px rgba(0,0,0,0.7);
+  }
 
   .profile-screen-logo { text-align: center; margin-bottom: 40px; }
   .profile-screen-logo .big-logo { font-family: var(--font-display); font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #fff; }
@@ -1226,6 +1246,105 @@
   </div>
 </div>
 
+<!-- ── EXE ACCOUNT SCREEN ──
+     Two jobs, one screen:
+     1) After PIN entry on an unmigrated profile — "migrate mode" — walks the
+        user through creating/logging into an EXE Account and transfers their
+        profile's data over.
+     2) Standalone, for anyone who has already migrated (returning visit with
+        no valid session, or after signing out) — "resume mode" — just a
+        normal login screen, no PIN, no profile grid, ever again.
+-->
+<div id="exe-screen" class="hidden">
+  <div class="corner-decor tl"></div><div class="corner-decor tr"></div>
+  <div class="corner-decor bl"></div><div class="corner-decor br"></div>
+
+  <div class="profile-screen-logo">
+    <div class="big-logo">SENTINEL</div>
+    <div class="big-sub" id="exe-screen-sub">EXE ACCOUNT</div>
+  </div>
+
+  <div id="exe-screen-box">
+
+    <!-- Migrate-mode banner — only shown when coming from an unmigrated PIN profile -->
+    <div id="exe-migrate-banner" class="hidden" style="text-align:center;margin-bottom:22px;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);line-height:1.7;">
+      <div style="font-family:var(--font-display);font-size:16px;font-weight:800;letter-spacing:2px;color:#fff;margin-bottom:8px;">MIGRATE YOUR PROFILE</div>
+      Create or log in to an EXE Account to move <span id="exe-migrate-profile-name" style="color:#fff;">this profile</span>'s data over — history, groups, config, and saved accounts all come with it. Your old profile is deleted once this completes.
+    </div>
+
+    <!-- ── CREATE ACCOUNT FORM ── -->
+    <div id="exe-form-create">
+      <div style="margin-bottom:14px;">
+        <label class="field-label">Display Name</label>
+        <input type="text" id="exe-c-name" placeholder="e.g. ModerationBot">
+      </div>
+      <div style="margin-bottom:14px;">
+        <label class="field-label">Email</label>
+        <input type="email" id="exe-c-email" placeholder="you@example.com">
+      </div>
+      <div style="margin-bottom:8px;">
+        <label class="field-label">Password</label>
+        <input type="password" id="exe-c-password" placeholder="At least 8 characters">
+      </div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-bottom:20px;line-height:1.6;">
+        Two-step verification is required for accounts created through Sentinel — you'll get a code by email at login. You can turn it off later from the EXE homepage.
+      </div>
+      <div id="exe-c-error" style="font-family:var(--font-mono);font-size:10px;color:#ff6b6b;min-height:14px;margin-bottom:10px;"></div>
+      <button class="btn btn-primary btn-block" id="exe-c-submit" onclick="exeSubmitCreate()">Create EXE Account →</button>
+      <div style="text-align:center;margin-top:16px;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">
+        Already have an account? <a href="javascript:void(0)" onclick="exeShowLogin()" style="color:#fff;text-decoration:underline;">Log in instead</a>
+      </div>
+    </div>
+
+    <!-- ── CHECK-YOUR-EMAIL STATE (after successful registration) ── -->
+    <div id="exe-form-verify" class="hidden" style="text-align:center;padding:10px 0;">
+      <div style="font-size:32px;margin-bottom:12px;">✓</div>
+      <div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:8px;">CHECK YOUR EMAIL</div>
+      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:22px;line-height:1.7;">
+        We sent a verification link to <span id="exe-verify-email" style="color:#fff;"></span>. Verify it, then log in below to finish migrating.
+      </div>
+      <button class="btn btn-primary btn-block" onclick="exeShowLogin(true)">Continue to Login →</button>
+    </div>
+
+    <!-- ── LOGIN FORM ── -->
+    <div id="exe-form-login" class="hidden">
+      <div style="margin-bottom:14px;">
+        <label class="field-label">Email</label>
+        <input type="email" id="exe-l-email" placeholder="you@example.com">
+      </div>
+      <div style="margin-bottom:8px;">
+        <label class="field-label">Password</label>
+        <input type="password" id="exe-l-password" placeholder="••••••••">
+      </div>
+      <div id="exe-l-error" style="font-family:var(--font-mono);font-size:10px;color:#ff6b6b;min-height:14px;margin:10px 0;"></div>
+      <button class="btn btn-primary btn-block" id="exe-l-submit" onclick="exeSubmitLogin()">Log In →</button>
+      <div id="exe-l-create-link" style="text-align:center;margin-top:16px;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">
+        Need an account? <a href="javascript:void(0)" onclick="exeShowCreate()" style="color:#fff;text-decoration:underline;">Create one instead</a>
+      </div>
+    </div>
+
+    <!-- ── 2FA CODE FORM ── -->
+    <div id="exe-form-2fa" class="hidden" style="text-align:center;">
+      <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:2px;margin-bottom:4px;">TWO-STEP VERIFICATION</div>
+      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:18px;">Enter the 6-digit code we emailed you.</div>
+      <input type="text" id="exe-2fa-code" placeholder="000000" maxlength="6" style="text-align:center;letter-spacing:8px;font-size:18px;margin-bottom:8px;" oninput="this.value=this.value.replace(/[^0-9]/g,'')">
+      <div id="exe-2fa-error" style="font-family:var(--font-mono);font-size:10px;color:#ff6b6b;min-height:14px;margin-bottom:10px;"></div>
+      <button class="btn btn-primary btn-block" id="exe-2fa-submit" onclick="exeSubmit2fa()">Verify →</button>
+    </div>
+
+    <!-- Skip-for-now — only visible in migrate mode -->
+    <div id="exe-skip-row" class="hidden" style="text-align:center;margin-top:24px;">
+      <a href="javascript:void(0)" onclick="exeSkipMigration()" style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:1px;">Skip for now — keep using this profile</a>
+    </div>
+
+    <!-- Sign-out-of-a-different-account — only visible in resume mode when a stale local flag exists -->
+    <div id="exe-forget-row" class="hidden" style="text-align:center;margin-top:24px;">
+      <a href="javascript:void(0)" onclick="exeForgetDevice()" style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);letter-spacing:1px;">Not you? Sign out of this device</a>
+    </div>
+
+  </div>
+</div>
+
 <!-- ── PIN MODAL ── -->
 <div class="modal-overlay" id="pin-modal">
   <div class="modal-box" style="max-width:360px;text-align:center;">
@@ -1311,53 +1430,95 @@
 
 <!-- ── SETTINGS MODAL ── -->
 <div class="modal-overlay" id="settings-modal">
-  <div class="modal-box">
+  <div class="modal-box modal-box-lg">
     <button class="modal-close" onclick="closeSettings()">✕</button>
-    <div class="section-title" style="margin-bottom:20px;">Settings</div>
+    <div class="section-title" style="margin-bottom:18px;">Settings</div>
 
-    <!-- Profile section -->
-    <div style="margin-bottom:24px;">
-      <div class="section-title">Profile</div>
-      <div id="settings-profile-info" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:14px;"></div>
+    <!-- Tab nav -->
+    <div class="settings-tabs">
+      <div class="settings-tab-btn active" id="stab-btn-profile" onclick="showSettingsTab('profile')">Profile</div>
+      <div class="settings-tab-btn" id="stab-btn-account" onclick="showSettingsTab('account')">EXE Account</div>
+      <div class="settings-tab-btn" id="stab-btn-extension" onclick="showSettingsTab('extension')">Extension</div>
+      <div class="settings-tab-btn" id="stab-btn-debug" onclick="showSettingsTab('debug')">Debug</div>
+    </div>
 
-      <!-- Avatar change -->
-      <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
-        <div id="settings-avatar-preview" style="width:56px;height:56px;border-radius:50%;border:1px solid var(--border);background:var(--surface3);display:flex;align-items:center;justify-content:center;font-family:var(--font-display);font-weight:800;font-size:20px;color:rgba(255,255,255,0.5);flex-shrink:0;overflow:hidden;"></div>
-        <div style="flex:1;">
-          <input type="file" id="settings-avatar-file" accept="image/*" style="display:none;" onchange="previewSettingsAvatar(this)">
-          <button class="btn btn-sm" onclick="document.getElementById('settings-avatar-file').click()">Change Avatar</button>
-          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-top:4px;">JPG, PNG, GIF — max 1MB</div>
-          <input type="hidden" id="settings-avatar-data">
-          <button class="btn btn-sm btn-primary" id="settings-avatar-save-btn" style="margin-top:6px;display:none;" onclick="saveSettingsAvatar()">Save Avatar</button>
+    <div class="settings-tab-body">
+
+    <!-- ══ TAB: PROFILE ══ -->
+    <div class="settings-tab-panel active" id="stab-profile">
+      <div style="margin-bottom:24px;">
+        <div class="section-title">Profile</div>
+        <div id="settings-profile-info" style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-bottom:14px;"></div>
+
+        <!-- Avatar change -->
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+          <div id="settings-avatar-preview" style="width:56px;height:56px;border-radius:50%;border:1px solid var(--border);background:var(--surface3);display:flex;align-items:center;justify-content:center;font-family:var(--font-display);font-weight:800;font-size:20px;color:rgba(255,255,255,0.5);flex-shrink:0;overflow:hidden;"></div>
+          <div style="flex:1;">
+            <input type="file" id="settings-avatar-file" accept="image/*" style="display:none;" onchange="previewSettingsAvatar(this)">
+            <button class="btn btn-sm" onclick="document.getElementById('settings-avatar-file').click()">Change Avatar</button>
+            <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-top:4px;">JPG, PNG, GIF — max 1MB</div>
+            <input type="hidden" id="settings-avatar-data">
+            <button class="btn btn-sm btn-primary" id="settings-avatar-save-btn" style="margin-top:6px;display:none;" onclick="saveSettingsAvatar()">Save Avatar</button>
+          </div>
+        </div>
+
+        <!-- PIN-based actions — hidden once this profile is migrated to an EXE Account -->
+        <div class="btn-group" id="settings-pin-actions">
+          <button class="btn btn-sm" onclick="openChangePinModal()">Change PIN</button>
+          <button class="btn btn-sm" onclick="openChangeNameModal()">Change Name</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteProfilePrompt()">Delete Profile</button>
+        </div>
+        <div class="btn-group" style="margin-top:8px;">
+          <button class="btn btn-sm btn-warn" onclick="signOutProfile()">Sign Out</button>
         </div>
       </div>
 
-      <div class="btn-group">
-        <button class="btn btn-sm" onclick="openChangePinModal()">Change PIN</button>
-        <button class="btn btn-sm" onclick="openChangeNameModal()">Change Name</button>
-        <button class="btn btn-sm btn-warn" onclick="signOutProfile()">Sign Out</button>
-        <button class="btn btn-sm btn-danger" onclick="deleteProfilePrompt()">Delete Profile</button>
+      <div class="divider"></div>
+
+      <div class="danger-zone">
+        <div class="section-title" style="color:var(--accent3);">Danger Zone</div>
+        <div class="btn-group">
+          <button class="btn btn-danger btn-sm" onclick="clearAllHistory()">Clear History</button>
+          <button class="btn btn-danger btn-sm" onclick="clearCredentials()">Unlink All Accounts</button>
+        </div>
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:8px;line-height:1.7;">
+          <b style="color:rgba(255,255,255,0.5);">Unlink All Accounts</b> — removes all saved cookies and clears the active session everywhere.
+        </div>
       </div>
     </div>
 
-    <div class="divider"></div>
-
-    <!-- Danger zone -->
-    <div class="danger-zone">
-      <div class="section-title" style="color:var(--accent3);">Danger Zone</div>
-      <div class="btn-group">
-        <button class="btn btn-danger btn-sm" onclick="clearAllHistory()">Clear History</button>
-        <button class="btn btn-danger btn-sm" onclick="clearCredentials()">Unlink All Accounts</button>
+    <!-- ══ TAB: EXE ACCOUNT ══ -->
+    <div class="settings-tab-panel" id="stab-account">
+      <!-- Shown once this profile is migrated -->
+      <div id="settings-exe-linked" class="hidden">
+        <div class="section-title">EXE Account</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;margin-bottom:16px;">
+          <div>
+            <div style="font-size:13px;font-weight:600;">Linked to EXE Account</div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:2px;" id="settings-exe-email">—</div>
+          </div>
+          <div style="width:8px;height:8px;border-radius:50%;background:#4ade80;flex-shrink:0;"></div>
+        </div>
+        <div class="info-box" style="margin-bottom:16px;">
+          Two-step verification is on for this account and can't be turned off here — manage your password, email, and 2SV from the EXE homepage.
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-sm btn-warn" onclick="signOutProfile()">Sign Out</button>
+        </div>
       </div>
-      <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-top:8px;line-height:1.7;">
-        <b style="color:rgba(255,255,255,0.5);">Unlink All Accounts</b> — removes all saved cookies and clears the active session everywhere.
+
+      <!-- Shown for profiles that haven't migrated yet -->
+      <div id="settings-exe-unlinked" class="hidden">
+        <div class="section-title">EXE Account</div>
+        <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);line-height:1.8;margin-bottom:18px;">
+          This profile is still using Sentinel's old PIN system. Sentinel is moving to EXE Accounts — migrating moves your history, groups, config, and saved Roblox accounts over, then permanently retires this PIN profile.
+        </div>
+        <button class="btn btn-primary btn-block" onclick="settingsStartMigration()">Migrate to EXE Account →</button>
       </div>
     </div>
 
-    <div class="divider"></div>
-
-    <!-- Extension connection management -->
-    <div style="margin-bottom:0;">
+    <!-- ══ TAB: EXTENSION ══ -->
+    <div class="settings-tab-panel" id="stab-extension">
       <div class="section-title" style="margin-bottom:12px;">Extension Connection</div>
 
       <!-- Status row -->
@@ -1430,75 +1591,76 @@
       </div>
     </div>
 
-    <div class="divider"></div>
+    <!-- ══ TAB: DEBUG ══ -->
+    <div class="settings-tab-panel" id="stab-debug">
+      <div class="debug-section">
+        <div class="section-title">Debug & Monitoring</div>
 
-    <!-- Debug section -->
-    <div class="debug-section">
-      <div class="section-title">Debug & Monitoring</div>
-
-      <div class="toggle-row" style="margin-bottom:12px;">
-        <div>
-          <div class="toggle-label" style="font-size:13px;">Debug Mode</div>
-          <div class="toggle-desc">Shows memory bar, live logs, and all system events</div>
-        </div>
-        <div class="toggle-sw" id="debug-mode-toggle" onclick="toggleDebugMode(this)"></div>
-      </div>
-
-      <div id="debug-panel-content" style="display:none;">
-
-        <!-- Memory stats -->
-        <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">Memory</div>
-        <div class="debug-grid">
-          <div class="debug-stat"><div class="debug-stat-val" id="dbg-rss">—</div><div class="debug-stat-lbl">Heap RSS (MB)</div></div>
-          <div class="debug-stat"><div class="debug-stat-val" id="dbg-pct">—</div><div class="debug-stat-lbl">Limit Usage %</div></div>
-          <div class="debug-stat"><div class="debug-stat-val" id="dbg-cpu">—</div><div class="debug-stat-lbl">CPU %</div></div>
-          <div class="debug-stat"><div class="debug-stat-val" id="dbg-sessions">—</div><div class="debug-stat-lbl">Active Sessions</div></div>
-        </div>
-        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-bottom:12px;" id="dbg-mem-detail">—</div>
-        <div class="btn-group" style="margin-bottom:18px;">
-          <button class="btn btn-sm" onclick="forceGC()">Force GC</button>
-          <button class="btn btn-sm" onclick="refreshDebugStats()">Refresh Stats</button>
-          <button class="btn btn-sm btn-warn" id="dbg-degraded-badge" style="display:none;">DEGRADED MODE ACTIVE</button>
-        </div>
-
-        <!-- Session inspector -->
-        <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Active Sessions</div>
-        <div id="dbg-sessions-list" style="margin-bottom:18px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:var(--font-mono);font-size:10px;color:var(--text-dim);">—</div>
-
-        <!-- Log viewer -->
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;">Live Logs</div>
-          <div style="display:flex;gap:6px;align-items:center;">
-            <select id="settings-log-level" onchange="renderSettingsLogs()" style="width:auto;padding:3px 8px;font-size:10px;">
-              <option value="">ALL</option>
-              <option value="INFO">INFO</option>
-              <option value="DEBUG">DEBUG</option>
-              <option value="WARN">WARN</option>
-              <option value="ERROR">ERROR</option>
-              <option value="ARCHIVE">ARCHIVE</option>
-              <option value="DM">DM</option>
-              <option value="NETWORK">NETWORK</option>
-              <option value="MEMORY">MEMORY</option>
-            </select>
-            <select id="settings-log-source" onchange="renderSettingsLogs()" style="width:auto;padding:3px 8px;font-size:10px;">
-              <option value="">ALL SOURCES</option>
-              <option value="MONITOR">MONITOR</option>
-              <option value="SYSTEM">SYSTEM</option>
-              <option value="WATCHDOG">WATCHDOG</option>
-              <option value="DEBUG">DEBUG</option>
-            </select>
-            <button class="btn btn-sm" style="padding:3px 10px;font-size:10px;" onclick="renderSettingsLogs()">Refresh</button>
-            <button class="btn btn-sm btn-danger" style="padding:3px 10px;font-size:10px;" onclick="clearServerLogs()">Clear</button>
+        <div class="toggle-row" style="margin-bottom:12px;">
+          <div>
+            <div class="toggle-label" style="font-size:13px;">Debug Mode</div>
+            <div class="toggle-desc">Shows memory bar, live logs, and all system events</div>
           </div>
+          <div class="toggle-sw" id="debug-mode-toggle" onclick="toggleDebugMode(this)"></div>
         </div>
-        <div class="debug-log-box" id="settings-log-box">
-          <div style="color:var(--text-dimmer);text-align:center;padding:20px 0;font-family:var(--font-mono);font-size:10px;">No logs yet</div>
-        </div>
-        <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-top:6px;" id="settings-log-count">0 entries</div>
 
+        <div id="debug-panel-content" style="display:none;">
+
+          <!-- Memory stats -->
+          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">Memory</div>
+          <div class="debug-grid">
+            <div class="debug-stat"><div class="debug-stat-val" id="dbg-rss">—</div><div class="debug-stat-lbl">Heap RSS (MB)</div></div>
+            <div class="debug-stat"><div class="debug-stat-val" id="dbg-pct">—</div><div class="debug-stat-lbl">Limit Usage %</div></div>
+            <div class="debug-stat"><div class="debug-stat-val" id="dbg-cpu">—</div><div class="debug-stat-lbl">CPU %</div></div>
+            <div class="debug-stat"><div class="debug-stat-val" id="dbg-sessions">—</div><div class="debug-stat-lbl">Active Sessions</div></div>
+          </div>
+          <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dimmer);margin-bottom:12px;" id="dbg-mem-detail">—</div>
+          <div class="btn-group" style="margin-bottom:18px;">
+            <button class="btn btn-sm" onclick="forceGC()">Force GC</button>
+            <button class="btn btn-sm" onclick="refreshDebugStats()">Refresh Stats</button>
+            <button class="btn btn-sm btn-warn" id="dbg-degraded-badge" style="display:none;">DEGRADED MODE ACTIVE</button>
+          </div>
+
+          <!-- Session inspector -->
+          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Active Sessions</div>
+          <div id="dbg-sessions-list" style="margin-bottom:18px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:var(--font-mono);font-size:10px;color:var(--text-dim);">—</div>
+
+          <!-- Log viewer -->
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+            <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);letter-spacing:2px;text-transform:uppercase;">Live Logs</div>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <select id="settings-log-level" onchange="renderSettingsLogs()" style="width:auto;padding:3px 8px;font-size:10px;">
+                <option value="">ALL</option>
+                <option value="INFO">INFO</option>
+                <option value="DEBUG">DEBUG</option>
+                <option value="WARN">WARN</option>
+                <option value="ERROR">ERROR</option>
+                <option value="ARCHIVE">ARCHIVE</option>
+                <option value="DM">DM</option>
+                <option value="NETWORK">NETWORK</option>
+                <option value="MEMORY">MEMORY</option>
+              </select>
+              <select id="settings-log-source" onchange="renderSettingsLogs()" style="width:auto;padding:3px 8px;font-size:10px;">
+                <option value="">ALL SOURCES</option>
+                <option value="MONITOR">MONITOR</option>
+                <option value="SYSTEM">SYSTEM</option>
+                <option value="WATCHDOG">WATCHDOG</option>
+                <option value="DEBUG">DEBUG</option>
+              </select>
+              <button class="btn btn-sm" style="padding:3px 10px;font-size:10px;" onclick="renderSettingsLogs()">Refresh</button>
+              <button class="btn btn-sm btn-danger" style="padding:3px 10px;font-size:10px;" onclick="clearServerLogs()">Clear</button>
+            </div>
+          </div>
+          <div class="debug-log-box" id="settings-log-box">
+            <div style="color:var(--text-dimmer);text-align:center;padding:20px 0;font-family:var(--font-mono);font-size:10px;">No logs yet</div>
+          </div>
+          <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dimmer);margin-top:6px;" id="settings-log-count">0 entries</div>
+
+        </div>
       </div>
     </div>
 
+    </div>
   </div>
 </div>
 
@@ -1885,7 +2047,42 @@ let STATE = {
   activeWlTab:    'all',
   isAdmin:        false,
   _lastPin:       null,
+  // EXE Account
+  migrated:       false,   // true once this profile is owned by an EXE Account
+  exeEmail:       null,
+  exeAccessToken: null,
 };
+
+// ── EXE ACCOUNT SYSTEM ──────────────────────────────────────────────────────
+// Point this at your deployed exe-accounts-api service, e.g.
+// 'https://exe-accounts-xyz.onrender.com'. Register/login/refresh/logout go
+// straight to this service from the browser — only migrate/resume touch
+// Sentinel's own backend (BASE_PATH), since those need Sentinel's database.
+const EXE_API_BASE = 'https://exe-accounts-api.onrender.com';
+
+const EXE_LS_REFRESH  = 'sentinel_exe_refresh_token';
+const EXE_LS_MIGRATED = 'sentinel_exe_migrated';
+
+async function exeApi(method, path, body, accessToken) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  if (accessToken) opts.headers['Authorization'] = 'Bearer ' + accessToken;
+  let r;
+  try { r = await fetch(EXE_API_BASE + path, opts); }
+  catch(e) { throw new Error('Could not reach the EXE Account server — check your connection'); }
+  let data;
+  try { data = await r.json(); }
+  catch(e) { throw new Error(`Unexpected response from EXE Account server (${r.status})`); }
+  if (!r.ok) {
+    const det = data.detail;
+    let msg;
+    if (typeof det === 'string') msg = det;
+    else if (Array.isArray(det)) msg = det.map(e => `${e.loc?.join('.')}: ${e.msg}`).join('; ');
+    else msg = data.error || `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
 
 // ── EXTENSION MAINTENANCE MODE ────────────────────────────────────────────────
 // Set to true to disable all extension connectivity in the UI.
@@ -2440,7 +2637,7 @@ async function submitPin() {
     STATE._lastPin = _pinValue;
     res.is_admin   = _pinTarget.is_admin || false;
     document.getElementById('pin-modal').classList.remove('open');
-    await loginToProfile(res);
+    openExeMigrateScreen(_pinTarget.id, _pinValue, res);
   } catch(e) {
     document.getElementById('pin-error').textContent = 'Wrong PIN — try again';
     _pinValue = '';
@@ -2494,6 +2691,8 @@ async function loginToProfile(profileData) {
   STATE.profileAvatar = profileData.avatar_url;
   STATE.hasCredential = profileData.hasCredential || false;
   STATE.isAdmin       = profileData.is_admin || false;
+  STATE.migrated       = profileData.migrated || false;
+  STATE.exeEmail        = profileData.exe_email || null;
 
   // Show/hide admin tab
   const adminTabBtn = document.getElementById('admin-tab-btn');
@@ -2508,8 +2707,9 @@ async function loginToProfile(profileData) {
   }
   document.getElementById('topbar-profile-name').textContent = profileData.name;
 
-  // Hide profile screen, show app
+  // Hide profile screen and the EXE Account screen, show app
   document.getElementById('profile-screen').classList.add('hidden');
+  document.getElementById('exe-screen').classList.add('hidden');
 
   // If saved credentials exist, restore them
   if (profileData.hasCredential && profileData.account) {
@@ -2521,7 +2721,242 @@ async function loginToProfile(profileData) {
   await initApp();
   await refreshSavedAccounts();
   applyExtMaintenance();
+  applySettingsExeSection();
   toast(`Welcome, ${profileData.name}!`, 'success');
+}
+
+
+// ── EXE ACCOUNT SCREEN ───────────────────────────────────────────────────────
+// _exeMigrateCtx is set only when we arrived here via a PIN login on an
+// unmigrated profile — that's what tells exeCompleteAuth() to call
+// /api/exe/migrate instead of /api/exe/login.
+let _exeMigrateCtx     = null;   // { profileId, pin, profileData }
+let _exe2faChallenge   = null;   // { token, app } while the 2FA step is showing
+let _exeRefreshTimer   = null;
+
+function exeSetLsMigrated() { try { localStorage.setItem(EXE_LS_MIGRATED, '1'); } catch(_) {} }
+function exeIsLsMigrated()  { try { return localStorage.getItem(EXE_LS_MIGRATED) === '1'; } catch(_) { return false; } }
+function exeStoreRefresh(token) { try { localStorage.setItem(EXE_LS_REFRESH, token); } catch(_) {} }
+function exeReadRefresh()  { try { return localStorage.getItem(EXE_LS_REFRESH); } catch(_) { return null; } }
+function exeClearRefresh() { try { localStorage.removeItem(EXE_LS_REFRESH); } catch(_) {} }
+
+function exeHideAllForms() {
+  ['exe-form-create','exe-form-verify','exe-form-login','exe-form-2fa'].forEach(id =>
+    document.getElementById(id).classList.add('hidden'));
+  document.getElementById('exe-c-error').textContent = '';
+  document.getElementById('exe-l-error').textContent = '';
+  document.getElementById('exe-2fa-error').textContent = '';
+}
+
+function exeShowCreate() {
+  exeHideAllForms();
+  document.getElementById('exe-form-create').classList.remove('hidden');
+}
+
+function exeShowLogin(prefillFromVerify) {
+  exeHideAllForms();
+  document.getElementById('exe-form-login').classList.remove('hidden');
+  if (prefillFromVerify) {
+    document.getElementById('exe-l-email').value = document.getElementById('exe-c-email').value.trim();
+  }
+  document.getElementById('exe-l-password').value = '';
+}
+
+function exeShow2fa() {
+  exeHideAllForms();
+  document.getElementById('exe-form-2fa').classList.remove('hidden');
+  document.getElementById('exe-2fa-code').value = '';
+  setTimeout(() => document.getElementById('exe-2fa-code').focus(), 50);
+}
+
+// Opens the screen in "migrate mode" — called right after a successful PIN
+// entry on a profile that hasn't been migrated yet.
+function openExeMigrateScreen(profileId, pin, profileData) {
+  _exeMigrateCtx = { profileId, pin, profileData };
+  document.getElementById('exe-migrate-banner').classList.remove('hidden');
+  document.getElementById('exe-migrate-profile-name').textContent = `"${profileData.name}"`;
+  document.getElementById('exe-screen-sub').textContent = 'MIGRATE THIS PROFILE';
+  document.getElementById('exe-skip-row').classList.remove('hidden');
+  document.getElementById('exe-forget-row').classList.add('hidden');
+  document.getElementById('exe-l-create-link').classList.remove('hidden');
+  exeShowCreate();
+  document.getElementById('exe-c-name').value = profileData.name || '';
+  document.getElementById('profile-screen').classList.add('hidden');
+  document.getElementById('exe-screen').classList.remove('hidden');
+}
+
+// Opens the screen in "resume mode" — this device has already migrated a
+// profile and there's no valid session (first visit on a new device, cleared
+// storage, expired/revoked refresh token, or an explicit sign-out).
+function exeOpenResumeScreen() {
+  _exeMigrateCtx = null;
+  document.getElementById('exe-migrate-banner').classList.add('hidden');
+  document.getElementById('exe-screen-sub').textContent = 'LOG IN TO CONTINUE';
+  document.getElementById('exe-skip-row').classList.add('hidden');
+  document.getElementById('exe-forget-row').classList.remove('hidden');
+  document.getElementById('exe-l-create-link').classList.add('hidden');
+  exeShowLogin();
+  document.getElementById('profile-screen').classList.add('hidden');
+  document.getElementById('exe-screen').classList.remove('hidden');
+}
+
+function exeSkipMigration() {
+  if (!_exeMigrateCtx) return;
+  const data = _exeMigrateCtx.profileData;
+  _exeMigrateCtx = null;
+  document.getElementById('exe-screen').classList.add('hidden');
+  loginToProfile(data);
+}
+
+// "Not you?" on the resume screen — forgets this device's EXE session
+// entirely and drops back to a blank login form. Does NOT touch the account
+// itself, just this browser's local state.
+function exeForgetDevice() {
+  exeClearRefresh();
+  STATE.exeAccessToken = null;
+  if (_exeRefreshTimer) { clearTimeout(_exeRefreshTimer); _exeRefreshTimer = null; }
+  exeShowLogin();
+  toast('Signed out of this device', 'warn');
+}
+
+async function exeSubmitCreate() {
+  const name  = document.getElementById('exe-c-name').value.trim();
+  const email = document.getElementById('exe-c-email').value.trim();
+  const pass  = document.getElementById('exe-c-password').value;
+  const errEl = document.getElementById('exe-c-error');
+  errEl.textContent = '';
+  if (!name)  { errEl.textContent = 'Enter a display name'; return; }
+  if (!email) { errEl.textContent = 'Enter your email'; return; }
+  if (pass.length < 8) { errEl.textContent = 'Password must be at least 8 characters'; return; }
+
+  const btn = document.getElementById('exe-c-submit');
+  btn.disabled = true; btn.textContent = 'Creating…';
+  try {
+    await exeApi('POST', '/auth/register', { email, password: pass, display_name: name, app: 'sentinel-web' });
+    document.getElementById('exe-verify-email').textContent = email;
+    exeHideAllForms();
+    document.getElementById('exe-form-verify').classList.remove('hidden');
+  } catch(e) {
+    errEl.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create EXE Account →';
+  }
+}
+
+async function exeSubmitLogin() {
+  const email = document.getElementById('exe-l-email').value.trim();
+  const pass  = document.getElementById('exe-l-password').value;
+  const errEl = document.getElementById('exe-l-error');
+  errEl.textContent = '';
+  if (!email || !pass) { errEl.textContent = 'Enter your email and password'; return; }
+
+  const btn = document.getElementById('exe-l-submit');
+  btn.disabled = true; btn.textContent = 'Logging in…';
+  try {
+    const res = await exeApi('POST', '/auth/login', { email, password: pass, app: 'sentinel-web' });
+    if (res.requires_2fa) {
+      _exe2faChallenge = res.challenge_token;
+      exeShow2fa();
+      toast('Check your email for a login code', 'success');
+    } else {
+      await exeCompleteAuth(res);
+    }
+  } catch(e) {
+    errEl.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Log In →';
+  }
+}
+
+async function exeSubmit2fa() {
+  const code  = document.getElementById('exe-2fa-code').value.trim();
+  const errEl = document.getElementById('exe-2fa-error');
+  errEl.textContent = '';
+  if (code.length !== 6) { errEl.textContent = 'Enter the 6-digit code'; return; }
+  if (!_exe2faChallenge) { errEl.textContent = 'This login attempt expired — log in again'; return; }
+
+  const btn = document.getElementById('exe-2fa-submit');
+  btn.disabled = true; btn.textContent = 'Verifying…';
+  try {
+    const res = await exeApi('POST', '/auth/verify-2fa', { challenge_token: _exe2faChallenge, code });
+    _exe2faChallenge = null;
+    await exeCompleteAuth(res);
+  } catch(e) {
+    errEl.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Verify →';
+  }
+}
+
+// Common landing point once we have a fresh access_token + refresh_token,
+// whether that came from a plain login or a 2FA verification.
+async function exeCompleteAuth(authData) {
+  const accessToken = authData.access_token;
+  STATE.exeAccessToken = accessToken;
+  exeStoreRefresh(authData.refresh_token);
+  scheduleExeSilentRefresh(authData.refresh_token);
+
+  try {
+    let profileResult;
+    if (_exeMigrateCtx) {
+      profileResult = await api('POST', '/api/exe/migrate', {
+        profile_id:   _exeMigrateCtx.profileId,
+        pin:          _exeMigrateCtx.pin,
+        access_token: accessToken,
+      });
+      toast('Profile migrated to your EXE Account!', 'success');
+    } else {
+      profileResult = await api('POST', '/api/exe/login', { access_token: accessToken });
+    }
+    _exeMigrateCtx = null;
+    exeSetLsMigrated();
+    await loginToProfile(profileResult);
+  } catch(e) {
+    const errEl = _exeMigrateCtx
+      ? document.getElementById('exe-c-error')
+      : document.getElementById('exe-l-error');
+    if (errEl) errEl.textContent = 'Signed in, but could not load your Sentinel data: ' + e.message;
+    toast('Error finishing sign-in: ' + e.message, 'error');
+  }
+}
+
+// Access tokens last 15 minutes — refresh at the 12-minute mark so an open
+// tab never has to interrupt the user with a re-login. Runs quietly forever
+// as long as the tab stays open; the browser's stored refresh token is what
+// makes the NEXT visit (or a page reload) silent too.
+function scheduleExeSilentRefresh(refreshToken) {
+  if (_exeRefreshTimer) clearTimeout(_exeRefreshTimer);
+  _exeRefreshTimer = setTimeout(async () => {
+    try {
+      const res = await exeApi('POST', '/auth/refresh', { refresh_token: refreshToken });
+      STATE.exeAccessToken = res.access_token;
+      exeStoreRefresh(res.refresh_token);
+      scheduleExeSilentRefresh(res.refresh_token);
+    } catch(e) {
+      // Refresh token is dead (revoked/expired) — the user will simply be
+      // asked to log in again next time they need something from the server.
+      exeClearRefresh();
+    }
+  }, 12 * 60 * 1000);
+}
+
+// Called once at boot when this device has already migrated. Tries to
+// silently resume the session from the stored refresh token; falls back to
+// the login form if that fails or nothing is stored.
+async function tryAutoExeLogin() {
+  const refreshToken = exeReadRefresh();
+  if (!refreshToken) { exeOpenResumeScreen(); return; }
+  try {
+    const res = await exeApi('POST', '/auth/refresh', { refresh_token: refreshToken });
+    STATE.exeAccessToken = res.access_token;
+    exeStoreRefresh(res.refresh_token);
+    scheduleExeSilentRefresh(res.refresh_token);
+    const profileResult = await api('POST', '/api/exe/login', { access_token: res.access_token });
+    await loginToProfile(profileResult);
+  } catch(e) {
+    exeClearRefresh();
+    exeOpenResumeScreen();
+  }
 }
 
 // ── APP INIT ──────────────────────────────────────────────────────────────────
@@ -3720,11 +4155,54 @@ function updateSlider(id, val, suffix) {
 }
 
 // ── SETTINGS MODAL ────────────────────────────────────────────────────────────
+function showSettingsTab(name) {
+  document.querySelectorAll('.settings-tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.settings-tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('stab-' + name).classList.add('active');
+  document.getElementById('stab-btn-' + name).classList.add('active');
+}
+
+// Toggles the PIN-based controls vs. the EXE Account panel depending on
+// whether the current profile has been migrated.
+function applySettingsExeSection() {
+  const pinActions = document.getElementById('settings-pin-actions');
+  const linked     = document.getElementById('settings-exe-linked');
+  const unlinked    = document.getElementById('settings-exe-unlinked');
+  if (!pinActions || !linked || !unlinked) return;
+  if (STATE.migrated) {
+    pinActions.classList.add('hidden');
+    linked.classList.remove('hidden');
+    unlinked.classList.add('hidden');
+    document.getElementById('settings-exe-email').textContent = STATE.exeEmail || '—';
+  } else {
+    pinActions.classList.remove('hidden');
+    linked.classList.add('hidden');
+    unlinked.classList.remove('hidden');
+  }
+}
+
+// "Migrate to EXE Account" button inside Settings, for a profile that's
+// already logged in via PIN — same destination as the post-PIN-entry screen,
+// just reached from a different door. Needs the PIN again since migration
+// changes are permanent.
+function settingsStartMigration() {
+  const pin = prompt(`Enter the PIN for "${STATE.profileName}" to begin migrating to an EXE Account.`);
+  if (pin === null || pin.trim() === '') return;
+  closeSettings();
+  openExeMigrateScreen(STATE.profileId, pin.trim(), {
+    id: STATE.profileId, name: STATE.profileName, avatar_url: STATE.profileAvatar,
+    hasCredential: STATE.hasCredential, is_admin: STATE.isAdmin,
+  });
+  if (_exeMigrateCtx) _exeMigrateCtx.fromSettings = true;
+}
+
 function openSettings() {
   document.getElementById('settings-modal').classList.add('open');
+  showSettingsTab('profile');
   const info = document.getElementById('settings-profile-info');
   if (info) info.textContent = `Signed in as: ${STATE.profileName || '—'} (ID: ${STATE.profileId || '—'})`;
   if (_cfg) syncSaveModeUI(_cfg.cookieSaveMode || 'ask');
+  applySettingsExeSection();
 
   // Populate avatar preview
   const ap = document.getElementById('settings-avatar-preview');
@@ -3805,10 +4283,23 @@ async function changeName() {
 
 function signOutProfile() {
   if (_liveInterval) clearInterval(_liveInterval);
+  const wasMigrated = STATE.migrated;
+  const refreshToken = exeReadRefresh();
   STATE.profileId = null; STATE.profileName = null; STATE.hasCredential = false;
   closeSettings();
-  document.getElementById('profile-screen').classList.remove('hidden');
-  loadProfileScreen();
+
+  if (wasMigrated) {
+    // Permanently locked out of the profile selector once migrated — sign out
+    // always lands back on the EXE login screen, never the PIN/profile grid.
+    if (_exeRefreshTimer) { clearTimeout(_exeRefreshTimer); _exeRefreshTimer = null; }
+    STATE.exeAccessToken = null;
+    exeClearRefresh();
+    if (refreshToken) exeApi('POST', '/auth/logout', { refresh_token: refreshToken }).catch(() => {});
+    exeOpenResumeScreen();
+  } else {
+    document.getElementById('profile-screen').classList.remove('hidden');
+    loadProfileScreen();
+  }
   toast('Signed out', 'warn');
 }
 
@@ -4192,7 +4683,13 @@ async function forceGC() {
 (async function boot() {
   applyExtMaintenance();
   try {
-    await loadProfileScreen();
+    if (exeIsLsMigrated()) {
+      // This device has already migrated — permanently skip the profile
+      // selector and try to resume (or fall back to the EXE login form).
+      await tryAutoExeLogin();
+    } else {
+      await loadProfileScreen();
+    }
   } catch(e) {
     // If something totally unexpected happened, show a retry in the grid
     const grid = document.getElementById('profile-grid');
@@ -4203,6 +4700,7 @@ async function forceGC() {
       </div>`;
   }
 })();
+
 </script>
 
 <!-- ── ADD ANOTHER ACCOUNT MODAL ── -->
