@@ -5,3 +5,4 @@ pydantic
 psycopg2-binary
 psutil
 python-multipart
+PyJWT==2.9.0
