@@ -69,7 +69,7 @@ def info(msg: str, level: str = "INFO") -> None:
 
 def require_db() -> Storage:
     if not db.configured or not DB_READY:
-        raise HTTPException(503, DB_ERROR or "Managed MySQL DATABASE_URL is not configured")
+        raise HTTPException(503, DB_ERROR or "DATABASE_URL is not configured")
     return db
 
 
@@ -83,9 +83,9 @@ async def start() -> None:
     try:
         db.init_schema()
         DB_READY = True
-        info("Managed MySQL schema ready")
+        info(f"{db.kind.capitalize()} schema ready")
     except Exception as exc:
-        info(f"MySQL schema initialization failed: {exc}", "ERROR")
+        info(f"{db.kind.capitalize()} schema initialization failed: {exc}", "ERROR")
 
 
 # ---- route helper: /sentinel/api is canonical; /api is a non-advertised alias ----

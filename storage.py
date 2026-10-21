@@ -61,7 +61,7 @@ class Storage:
             raise StorageError("DATABASE_URL is not configured")
         parsed = urlparse(self.database_url.replace("mysql+pymysql://", "mysql://", 1))
         if not parsed.hostname or not parsed.path.strip("/"):
-            raise StorageError("DATABASE_URL is missing a MySQL host or database")
+            raise StorageError("DATABASE_URL is missing a database host or database name")
         query = parse_qs(parsed.query)
         local_host = parsed.hostname in {"localhost", "127.0.0.1"}
         ssl_disabled = query.get("ssl", [""])[0].lower() in {"0", "false", "disabled"}
