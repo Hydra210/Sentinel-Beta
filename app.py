@@ -38,6 +38,8 @@ app.mount("/sentinel/static", StaticFiles(directory=STATIC), name="static")
 EXE_API_BASE = (os.getenv("EXE_API_BASE") or os.getenv("EXE_API_URL") or "https://exe-accounts-api.onrender.com").rstrip("/")
 EXE_JWT_SECRET = os.getenv("EXE_JWT_SECRET", "")
 COOKIE_NAME = "sentinel_session"  # deliberately not platform-reserved app_session_id
+TRUSTED_COOKIE_NAME = "sentinel_trusted_device"
+TRUSTED_TTL = 30 * 86400
 TTL = max(300, int(os.getenv("SENTINEL_SESSION_TTL_SECONDS", str(7 * 86400))))
 # A dedicated key may be supplied. Otherwise derive a namespaced encryption key
 # from the private, stable database credential; neither material reaches clients.
@@ -208,6 +210,37 @@ def install_cookie(response: JSONResponse, request: Request, value: str) -> None
     response.set_cookie(COOKIE_NAME, value, httponly=True, secure=secure, samesite=samesite, max_age=TTL, path="/", domain=domain)
 
 
+def request_location_hash(request: Request) -> str:
+    forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for") or (request.client.host if request.client else "")
+    ip = forwarded.split(",", 1)[0].strip()
+    if ":" in ip and ip.count(":") > 1:
+        ip = ":".join(ip.split(":")[:4])
+    elif "." in ip:
+        ip = ".".join(ip.split(".")[:3])
+    return h(ip + "|" + request.headers.get("user-agent", "")[:240])
+
+
+def install_trusted_cookie(response: JSONResponse, request: Request, value: str) -> None:
+    secure, samesite = cookie_settings(request)
+    domain = os.getenv("SENTINEL_COOKIE_DOMAIN", "").strip().lstrip(".") or None
+    response.set_cookie(TRUSTED_COOKIE_NAME, value, httponly=True, secure=secure, samesite=samesite, max_age=TRUSTED_TTL, path="/", domain=domain)
+
+
+def trusted_device(request: Request) -> dict[str, Any] | None:
+    raw = request.cookies.get(TRUSTED_COOKIE_NAME)
+    if not raw or len(raw) < 32 or not db.configured or not DB_READY:
+        return None
+    row = db.fetch_one("SELECT * FROM trusted_devices WHERE token_hash=?", (h(raw),))
+    if not row:
+        return None
+    expiry = date_value(row.get("expires_at"))
+    if not expiry or expiry <= datetime.now(timezone.utc) or row.get("location_hash") != request_location_hash(request):
+        db.execute("DELETE FROM trusted_devices WHERE token_hash=?", (h(raw),))
+        return None
+    db.execute("UPDATE trusted_devices SET last_seen_at=CURRENT_TIMESTAMP WHERE token_hash=?", (h(raw),))
+    return row
+
+
 def remove_cookie(response: JSONResponse, request: Request) -> None:
     secure, samesite = cookie_settings(request)
     domain = os.getenv("SENTINEL_COOKIE_DOMAIN", "").strip().lstrip(".") or None
@@ -274,7 +307,7 @@ async def verify_access(access_token: str) -> dict[str, str]:
     return identity(await exe("GET", "/auth/me", token=access_token))
 
 
-async def create_session(request: Request, access_token: str, refresh_token: str | None = None) -> JSONResponse:
+async def create_session(request: Request, access_token: str, refresh_token: str | None = None, remember_me: bool = False) -> JSONResponse:
     account = await verify_access(access_token)
     store = require_db()
     store.upsert_user(account["id"], account["email"], account["name"], account["avatar_url"])
@@ -283,6 +316,11 @@ async def create_session(request: Request, access_token: str, refresh_token: str
                   (h(raw), account["id"], enc(access_token), enc(refresh_token), datetime.now(timezone.utc) + timedelta(seconds=TTL)))
     response = JSONResponse({"ok": True, "user": {key: account[key] for key in ("id", "name", "email")}})
     install_cookie(response, request, raw)
+    if remember_me and refresh_token:
+        trusted_raw = secrets.token_urlsafe(48)
+        store.execute("INSERT INTO trusted_devices (token_hash,user_id,refresh_token_enc,location_hash,expires_at) VALUES (?,?,?,?,?)",
+                      (h(trusted_raw), account["id"], enc(refresh_token), request_location_hash(request), datetime.now(timezone.utc) + timedelta(seconds=TRUSTED_TTL)))
+        install_trusted_cookie(response, request, trusted_raw)
     return response
 
 
@@ -295,11 +333,13 @@ class RegisterBody(BaseModel):
 class LoginBody(BaseModel):
     email: str
     password: str
+    remember_me: bool = False
 
 
 class TwoFactorBody(BaseModel):
     challenge_token: str
     code: str
+    remember_me: bool = False
 
 
 class EmailBody(BaseModel):
@@ -311,16 +351,34 @@ class MePatch(BaseModel):
     avatar_url: Optional[str] = None
 
 
-async def provider_login(request: Request, path: str, body: dict[str, Any]) -> JSONResponse:
+async def trusted_refresh(request: Request, row: dict[str, Any]) -> JSONResponse:
+    refresh_token = dec(row.get("refresh_token_enc"))
+    if not refresh_token:
+        return JSONResponse({"requires_2fa": True, "trusted_device_expired": True})
+    reply = await exe("POST", "/auth/refresh", {"refresh_token": refresh_token})
+    access = reply.get("access_token")
+    if not isinstance(access, str):
+        return JSONResponse({"requires_2fa": True, "trusted_device_expired": True})
+    next_refresh = reply.get("refresh_token") if isinstance(reply.get("refresh_token"), str) else refresh_token
+    response = await create_session(request, access, next_refresh, remember_me=True)
+    db.execute("UPDATE trusted_devices SET refresh_token_enc=?,expires_at=? WHERE token_hash=?",
+               (enc(next_refresh), datetime.now(timezone.utc) + timedelta(seconds=TRUSTED_TTL), row["token_hash"]))
+    return response
+
+
+async def provider_login(request: Request, path: str, body: dict[str, Any], remember_me: bool = False) -> JSONResponse:
     csrf(request)
     response = await exe("POST", path, body)
     if response.get("requires_2fa"):
+        trusted = trusted_device(request)
+        if trusted:
+            return await trusted_refresh(request, trusted)
         return JSONResponse({"requires_2fa": True, "challenge_token": response.get("challenge_token", "")})
     token = response.get("access_token")
     if not isinstance(token, str):
         raise HTTPException(503, "EXE account service returned no access token")
     refresh = response.get("refresh_token") if isinstance(response.get("refresh_token"), str) else None
-    return await create_session(request, token, refresh)
+    return await create_session(request, token, refresh, remember_me=remember_me)
 
 
 @api("POST", "/auth/register")
@@ -332,12 +390,14 @@ async def register(body: RegisterBody, request: Request):
 
 @api("POST", "/auth/login")
 async def login(body: LoginBody, request: Request):
-    return await provider_login(request, "/auth/login", {**body.model_dump(), "app": "sentinel-web"})
+    payload = body.model_dump(); remember_me = payload.pop("remember_me", False)
+    return await provider_login(request, "/auth/login", {**payload, "app": "sentinel-web"}, remember_me=remember_me)
 
 
 @api("POST", "/auth/verify-2fa")
 async def verify_2fa(body: TwoFactorBody, request: Request):
-    return await provider_login(request, "/auth/verify-2fa", body.model_dump())
+    payload = body.model_dump(); remember_me = payload.pop("remember_me", False)
+    return await provider_login(request, "/auth/verify-2fa", payload, remember_me=remember_me)
 
 
 @api("POST", "/auth/forgot-password")

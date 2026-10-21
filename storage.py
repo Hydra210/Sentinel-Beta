@@ -163,6 +163,15 @@ class Storage:
                 created_at {timestamp} NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_seen_at {timestamp} NOT NULL DEFAULT CURRENT_TIMESTAMP
             )""",
+            f"""CREATE TABLE IF NOT EXISTS trusted_devices (
+                token_hash CHAR(64) PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                refresh_token_enc TEXT NOT NULL,
+                location_hash CHAR(64) NOT NULL DEFAULT '',
+                expires_at {timestamp} NOT NULL,
+                created_at {timestamp} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at {timestamp} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""",
             """CREATE TABLE IF NOT EXISTS sentinel_groups (
                 id VARCHAR(64) NOT NULL,
                 user_id VARCHAR(255) NOT NULL,
@@ -200,12 +209,18 @@ class Storage:
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )"""
-            ddl[2] = """CREATE TABLE IF NOT EXISTS sentinel_groups (
+            ddl[2] = """CREATE TABLE IF NOT EXISTS trusted_devices (
+                token_hash CHAR(64) PRIMARY KEY, user_id VARCHAR(255) NOT NULL,
+                refresh_token_enc TEXT NOT NULL, location_hash CHAR(64) NOT NULL DEFAULT '',
+                expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )"""
+            ddl[3] = """CREATE TABLE IF NOT EXISTS sentinel_groups (
                 id VARCHAR(64) NOT NULL, user_id VARCHAR(255) NOT NULL,
                 name VARCHAR(255) NOT NULL DEFAULT '', added_at DOUBLE NOT NULL,
                 PRIMARY KEY (id, user_id)
             )"""
-            ddl[3] = """CREATE TABLE IF NOT EXISTS history (
+            ddl[4] = """CREATE TABLE IF NOT EXISTS history (
                 id VARCHAR(128) PRIMARY KEY, user_id VARCHAR(255) NOT NULL,
                 username VARCHAR(255) NOT NULL DEFAULT '', display_name VARCHAR(255) NOT NULL DEFAULT '',
                 roblox_user_id VARCHAR(64) NOT NULL DEFAULT '', audio_name VARCHAR(500) NOT NULL DEFAULT '',
@@ -222,6 +237,7 @@ class Storage:
                 indexes = [
                     "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
                     "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_trusted_devices_user ON trusted_devices(user_id)",
                     "CREATE INDEX IF NOT EXISTS idx_groups_user_added ON sentinel_groups(user_id, added_at)",
                     "CREATE INDEX IF NOT EXISTS idx_history_user_time ON history(user_id, occurred_at)",
                     "CREATE INDEX IF NOT EXISTS idx_history_user_asset ON history(user_id, audio_id)",

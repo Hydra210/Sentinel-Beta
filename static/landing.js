@@ -1,4 +1,4 @@
-import { icon, mountIcons } from './common.js';
+import { icon, mountIcons, request } from './common.js';
 const panels = {
   monitor: `<div class="detail-top"><span>GROUP MONITORING</span><span class="live-badge">ON WATCH</span></div><h3>Your groups. Covered.</h3><p>One clear view of the communities you protect.</p><div class="detail-row"><span class="group-symbol">CG</span><div>Community group<small>Audio · Models · Decals</small></div><span class="mini-badge allowed">MONITORING</span></div><div class="detail-row"><span class="group-symbol">DG</span><div>Development group<small>Audio · Models · Meshes</small></div><span class="mini-badge allowed">MONITORING</span></div><div class="detail-row"><span class="group-symbol">SC</span><div>Studio collective<small>Audio · Video · Animation</small></div><span class="mini-badge allowed">MONITORING</span></div><div class="detail-footer">${icon('activity')} CHECKING EVERY 60 SECONDS <span style="margin-left:auto">ILLUSTRATIVE PREVIEW</span></div>`,
   rules: `<div class="detail-top"><span>MODERATION RULES</span><span class="mono subtle">YOUR WORKSPACE</span></div><h3>Only what you choose.</h3><p>Select asset types. Trust the right people. Fine-tune the rest.</p><div class="detail-chips"><span>${icon('check')} Audio</span><span>${icon('check')} Models</span><span>${icon('check')} Decals</span><span>${icon('check')} Meshes</span></div><div class="detail-row" style="margin-top:16px"><div>Trusted uploaders<small>Global and per-asset allowlists</small></div>${icon('shield')}</div><div class="detail-row"><div>Archive delay<small>A little time before Sentinel takes action</small></div><span class="mono">10 SECONDS</span></div><div class="detail-footer">${icon('sliders')} YOUR RULES, CONSISTENTLY ENFORCED.</div>`,
@@ -22,6 +22,13 @@ document.querySelectorAll('[data-preview]').forEach(button => {
   });
 });
 setPreview('monitor'); mountIcons();
+request('/auth/me').then(({user}) => {
+  const current = document.getElementById('header-actions');
+  const signedIn = document.getElementById('logged-in-actions');
+  const greeting = document.getElementById('welcome-account');
+  if (current && signedIn) { current.classList.add('hidden'); signedIn.classList.remove('hidden'); }
+  if (greeting && user?.name) greeting.textContent = `Signed in as ${user.name}`;
+}).catch(() => {});
 document.getElementById('year').textContent = new Date().getFullYear();
 const video = document.getElementById('hero-video');
 const motion = window.matchMedia('(prefers-reduced-motion: reduce)');

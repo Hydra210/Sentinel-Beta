@@ -21,6 +21,7 @@ function setMode(next) {
   $('password').minLength = mode === 'create' ? 8 : 1;
   $('password').autocomplete = mode === 'create' ? 'new-password' : 'current-password';
   $('verification-code').required = mode === '2fa'; $('verification-code').disabled = mode !== '2fa';
+  $('remember-device-row').classList.toggle('hidden', !['login','2fa'].includes(mode));
   $('login-tab').classList.toggle('active', mode === 'login'); $('login-tab').setAttribute('aria-selected', String(mode === 'login'));
   $('create-tab').classList.toggle('active', mode === 'create'); $('create-tab').setAttribute('aria-selected', String(mode === 'create'));
   const copy = {
@@ -58,8 +59,8 @@ form.addEventListener('submit', async event => {
       $('form-success').textContent = 'If an account exists for this email, a reset link is on its way. Check your inbox and spam folder.';
     } else {
       const result = mode === '2fa'
-        ? await post('/auth/verify-2fa', { challenge_token: challenge, code: $('verification-code').value.trim() })
-        : await post('/auth/login', { email, password: $('password').value, app: 'sentinel-web' });
+        ? await post('/auth/verify-2fa', { challenge_token: challenge, code: $('verification-code').value.trim(), remember_me: $('remember-device').checked })
+        : await post('/auth/login', { email, password: $('password').value, app: 'sentinel-web', remember_me: $('remember-device').checked });
       if (result.requires_2fa) {
         challenge = result.challenge_token; setMode('2fa'); $('verification-code').focus();
       } else {
