@@ -35,14 +35,14 @@ STATIC.mkdir(exist_ok=True)
 app = FastAPI(title="Sentinel API", docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/sentinel/static", StaticFiles(directory=STATIC), name="static")
 
-EXE_API_BASE = os.getenv("EXE_API_BASE", "https://exe-accounts-api.onrender.com").rstrip("/")
+EXE_API_BASE = (os.getenv("EXE_API_BASE") or os.getenv("EXE_API_URL") or "https://exe-accounts-api.onrender.com").rstrip("/")
 EXE_JWT_SECRET = os.getenv("EXE_JWT_SECRET", "")
 COOKIE_NAME = "sentinel_session"  # deliberately not platform-reserved app_session_id
 TTL = max(300, int(os.getenv("SENTINEL_SESSION_TTL_SECONDS", str(7 * 86400))))
 # A dedicated key may be supplied. Otherwise derive a namespaced encryption key
 # from the private, stable database credential; neither material reaches clients.
 # Rotating either credential deliberately invalidates encrypted provider tokens.
-_crypto_secret = os.getenv("SENTINEL_SESSION_SECRET") or os.getenv("DATABASE_URL") or os.getenv("DB_PATH") or secrets.token_urlsafe(48)
+_crypto_secret = os.getenv("SENTINEL_SESSION_SECRET") or os.getenv("SENTINEL_MASTER_KEY") or os.getenv("DATABASE_URL") or os.getenv("DB_PATH") or secrets.token_urlsafe(48)
 fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(("sentinel:exe-token:v1:" + _crypto_secret).encode()).digest()))
 
 try:
@@ -75,7 +75,7 @@ def require_db() -> Storage:
 
 @app.on_event("startup")
 async def start() -> None:
-    global DB_READY
+    global DB_READY, DB_ERROR
     DB_READY = False
     if not db.configured:
         info("DATABASE_URL unavailable; protected API will fail closed", "WARN")
@@ -85,6 +85,7 @@ async def start() -> None:
         DB_READY = True
         info(f"{db.kind.capitalize()} schema ready")
     except Exception as exc:
+        DB_ERROR = "Database initialization failed; check the Render service logs."
         info(f"{db.kind.capitalize()} schema initialization failed: {exc}", "ERROR")
 
 

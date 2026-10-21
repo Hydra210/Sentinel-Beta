@@ -12,7 +12,7 @@ Install the pinned Python requirements with `pip install -r requirements.txt`, t
 
 For a native Render Python service, set `PYTHON_VERSION` to a supported released version such as `3.13.5`, use `pip install -r requirements.txt` as the build command, and use `uvicorn app:app --host 0.0.0.0 --port $PORT` as the start command. The Pydantic requirement intentionally allows the latest compatible wheel so Render does not try to compile Rust dependencies in its read-only build environment.
 
-Account-linked moderation data uses the PostgreSQL or MySQL-compatible `DATABASE_URL` supplied by the deployment environment. PostgreSQL is supported directly for Render deployments. The database starts empty; the uploaded `sentinel.db` is deliberately not imported. EXE Accounts remains the authentication provider at `https://exe-accounts-api.onrender.com`.
+Account-linked moderation data uses the PostgreSQL or MySQL-compatible `DATABASE_URL` supplied by the deployment environment. PostgreSQL is supported directly for Render deployments. The database starts empty; the uploaded `sentinel.db` is deliberately not imported. EXE Accounts remains the authentication provider at `https://exe-accounts-api.onrender.com`; both `EXE_API_BASE` and the existing `EXE_API_URL` name are accepted.
 
 If the original Render service only has `DB_PATH` on its persistent disk, Sentinel uses a separate `sentinel-fresh.db` beside the legacy file. This preserves the disk while honoring the fresh-start requirement; legacy profiles, migration data, and incompatible old tables are not imported. Set `SENTINEL_DB_PATH` to choose a different fresh SQLite filename, or provide `DATABASE_URL` to use PostgreSQL/MySQL instead.
 
