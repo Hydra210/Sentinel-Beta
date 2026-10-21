@@ -16,7 +16,7 @@ function send(path, body = {}) { return api(path, {method:'POST',body:JSON.strin
 function showTab(name) {
   currentTab = name;
   document.querySelectorAll('.dashboard-tab').forEach(panel => panel.classList.toggle('active', panel.id === 'tab-' + name));
-  document.querySelectorAll('.dashboard-nav [data-tab]').forEach(button => { button.classList.toggle('active', button.dataset.tab === name); if (button.dataset.tab === name) button.setAttribute('aria-current','page'); else button.removeAttribute('aria-current'); });
+  document.querySelectorAll('.dashboard-nav [data-tab], .mobile-dashboard-nav [data-tab]').forEach(button => { button.classList.toggle('active', button.dataset.tab === name); if (button.dataset.tab === name) button.setAttribute('aria-current','page'); else button.removeAttribute('aria-current'); });
   const titles = {overview:'Overview',groups:'Groups',rules:'Moderation rules',history:'Activity history',settings:'Settings'};
   $('breadcrumb-title').textContent = titles[name]; document.title = `Sentinel — ${titles[name]}`;
   window.scrollTo({top:0,behavior:'instant'});

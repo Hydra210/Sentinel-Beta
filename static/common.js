@@ -39,7 +39,7 @@ export async function request(path, options = {}) {
   const timeout = setTimeout(() => controller.abort(), 25000);
   try {
     const response = await fetch(API + path, {
-      credentials: 'same-origin', ...options, signal: controller.signal,
+      credentials: 'include', ...options, signal: controller.signal,
       headers: { 'Content-Type': 'application/json', 'X-Sentinel-Request': '1', ...options.headers },
     });
     const data = await response.json().catch(() => ({}));

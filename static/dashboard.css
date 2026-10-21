@@ -6,3 +6,19 @@
 
 /* Empty states use the same icon holder as initial static markup. */
 .empty-state>span:first-child{display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;margin-bottom:14px;background:#ffffff03;border:1px solid #ffffff12;border-radius:9px;color:#787878}.dashboard-content .empty-state>span:first-child{width:36px;height:36px;margin-bottom:13px}
+
+.mobile-dashboard-nav{display:none}
+@media(max-width:800px){
+  .dashboard-page{padding-bottom:68px}
+  .mobile-dashboard-nav{position:fixed;display:flex;left:0;right:0;bottom:0;height:64px;z-index:40;align-items:stretch;justify-content:space-around;background:#151515ef;border-top:1px solid #ffffff18;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);padding:6px 8px calc(6px + env(safe-area-inset-bottom))}
+  .mobile-dashboard-nav button{flex:1;display:flex;min-width:0;flex-direction:column;align-items:center;justify-content:center;gap:4px;background:none;border:0;color:#6f6f6f;border-radius:6px;padding:4px 2px}
+  .mobile-dashboard-nav button.active{color:#e5e5e5;background:#ffffff0a}
+  .mobile-dashboard-nav .icon{width:17px;height:17px}
+  .mobile-dashboard-nav small{font:7px var(--mono);letter-spacing:.2px;white-space:nowrap}
+}
+@media(max-width:560px){
+  .dashboard-page{padding-bottom:72px}
+  .mobile-dashboard-nav{height:68px;padding-inline:5px}
+  .mobile-dashboard-nav .icon{width:16px;height:16px}
+  .mobile-dashboard-nav small{font-size:6px}
+}

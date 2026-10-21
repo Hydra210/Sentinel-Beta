@@ -204,12 +204,14 @@ def cookie_settings(request: Request) -> tuple[bool, Literal["lax", "none"]]:
 
 def install_cookie(response: JSONResponse, request: Request, value: str) -> None:
     secure, samesite = cookie_settings(request)
-    response.set_cookie(COOKIE_NAME, value, httponly=True, secure=secure, samesite=samesite, max_age=TTL, path="/")
+    domain = os.getenv("SENTINEL_COOKIE_DOMAIN", "").strip().lstrip(".") or None
+    response.set_cookie(COOKIE_NAME, value, httponly=True, secure=secure, samesite=samesite, max_age=TTL, path="/", domain=domain)
 
 
 def remove_cookie(response: JSONResponse, request: Request) -> None:
     secure, samesite = cookie_settings(request)
-    response.delete_cookie(COOKIE_NAME, httponly=True, secure=secure, samesite=samesite, path="/")
+    domain = os.getenv("SENTINEL_COOKIE_DOMAIN", "").strip().lstrip(".") or None
+    response.delete_cookie(COOKIE_NAME, httponly=True, secure=secure, samesite=samesite, path="/", domain=domain)
 
 
 # ---- EXE Account proxy and authoritative token verification ----------------------
