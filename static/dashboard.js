@@ -9,7 +9,7 @@ function empty(symbol, title, description, action = '') {
 }
 async function api(path, options = {}) {
   try { return await request(path, options); }
-  catch (error) { if (error.status === 401) location.assign('/sentinel/login?next=/sentinel/Dashboard'); throw error; }
+  catch (error) { error.endpoint = path.split('?')[0]; if (error.status === 401) location.assign('/sentinel/login?next=/sentinel/Dashboard'); throw error; }
 }
 function accountQuery(extra = '') { return `profile_id=${encodeURIComponent(user.id)}${extra}`; }
 function send(path, body = {}) { return api(path, {method:'POST',body:JSON.stringify({profile_id:user.id,...body})}); }
@@ -28,7 +28,11 @@ function askConfirm(title, description, callback, action = 'Confirm') {
 function showDialog(id) { $(id).showModal(); }
 function openConnect() { $('connect-error').textContent=''; $('connect-form').reset(); showDialog('connect-dialog'); }
 function openGroup() { $('group-error').textContent=''; $('group-form').reset(); showDialog('group-dialog'); }
-function errorBanner(error) { $('dashboard-error').textContent = error.message; $('dashboard-error').classList.remove('hidden'); }
+function errorBanner(error) {
+  const endpoint = error.endpoint ? ` (${error.endpoint.replace(/^\//,'')})` : '';
+  $('dashboard-error').textContent = `Sentinel could not load this workspace${endpoint}: ${error.message}`;
+  $('dashboard-error').classList.remove('hidden');
+}
 function renderStatus() {
   const monitoring = !!status.monitoring;
   [ $('top-status'), $('monitor-status') ].forEach(element => { element.classList.toggle('online', monitoring); element.textContent = monitoring ? 'MONITORING' : 'STANDBY'; });

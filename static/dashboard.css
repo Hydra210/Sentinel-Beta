@@ -109,3 +109,7 @@
   .panel,.monitor-panel,.connection-panel{min-width:0;max-width:100%;overflow:hidden}
   .mobile-dashboard-nav{position:fixed!important;display:flex!important;z-index:100;}
 }
+
+@media(max-width:800px){
+  .monitor-panel>.button{width:100%;margin-left:0!important;margin-right:0!important;justify-content:center;align-self:stretch}
+}
