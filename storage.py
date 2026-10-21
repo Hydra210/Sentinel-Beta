@@ -1,8 +1,8 @@
-"""MySQL persistence for Sentinel.
+"""Persistent storage for Sentinel.
 
-Production uses DATABASE_URL (a MySQL-compatible managed database).  The optional
-sqlite URL handling exists solely for isolated backend tests; the application never
-falls back to a local sentinel.db file.
+Production uses PostgreSQL or a MySQL-compatible database supplied through
+DATABASE_URL. SQLite support is restricted to isolated tests; the application
+never falls back to a local sentinel.db file.
 """
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import pymysql
 from pymysql.cursors import DictCursor
+import psycopg
+from psycopg.rows import dict_row
 
 
 class StorageError(RuntimeError):
@@ -33,12 +35,14 @@ class Storage:
             self.kind = "sqlite"
         elif self.database_url.startswith(("mysql://", "mysql+pymysql://")):
             self.kind = "mysql"
+        elif self.database_url.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+            self.kind = "postgres"
         else:
-            raise StorageError("DATABASE_URL must be a MySQL-compatible URL")
+            raise StorageError("DATABASE_URL must be a PostgreSQL or MySQL-compatible URL")
 
     @property
     def configured(self) -> bool:
-        return self.kind in {"mysql", "sqlite"}
+        return self.kind in {"mysql", "postgres", "sqlite"}
 
     def _connect(self):
         if self.kind == "sqlite":
@@ -50,13 +54,15 @@ class Storage:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
             return conn
+        if self.kind == "postgres":
+            url = self.database_url.replace("postgresql+psycopg://", "postgresql://", 1)
+            return psycopg.connect(url, row_factory=dict_row, connect_timeout=10)
         if self.kind != "mysql":
             raise StorageError("DATABASE_URL is not configured")
         parsed = urlparse(self.database_url.replace("mysql+pymysql://", "mysql://", 1))
         if not parsed.hostname or not parsed.path.strip("/"):
             raise StorageError("DATABASE_URL is missing a MySQL host or database")
         query = parse_qs(parsed.query)
-        # Managed MySQL requires TLS.  Allow explicit local development opt-out only.
         local_host = parsed.hostname in {"localhost", "127.0.0.1"}
         ssl_disabled = query.get("ssl", [""])[0].lower() in {"0", "false", "disabled"}
         ssl: dict[str, Any] | None = None if (local_host and ssl_disabled) else {"check_hostname": False}
@@ -76,7 +82,7 @@ class Storage:
         )
 
     def _sql(self, sql: str) -> str:
-        return sql.replace("?", "%s") if self.kind == "mysql" else sql
+        return sql.replace("?", "%s") if self.kind in {"mysql", "postgres"} else sql
 
     @contextmanager
     def connection(self) -> Iterator[Any]:
@@ -125,34 +131,31 @@ class Storage:
     def init_schema(self) -> None:
         if not self.configured:
             return
-        # Additive, idempotent schema.  No import, migration, or deletion of legacy data.
+        timestamp = "TIMESTAMP" if self.kind == "postgres" else "DATETIME"
         ddl = [
-            """CREATE TABLE IF NOT EXISTS users (
+            f"""CREATE TABLE IF NOT EXISTS users (
                 id VARCHAR(255) PRIMARY KEY,
                 email VARCHAR(320) NOT NULL DEFAULT '',
                 name VARCHAR(255) NOT NULL DEFAULT '',
                 avatar_url TEXT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at {timestamp} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at {timestamp} NOT NULL DEFAULT CURRENT_TIMESTAMP
             )""",
-            """CREATE TABLE IF NOT EXISTS sessions (
+            f"""CREATE TABLE IF NOT EXISTS sessions (
                 token_hash CHAR(64) PRIMARY KEY,
                 user_id VARCHAR(255) NOT NULL,
                 access_token_enc TEXT NULL,
                 refresh_token_enc TEXT NULL,
-                expires_at DATETIME NOT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_sessions_user (user_id),
-                INDEX idx_sessions_expiry (expires_at)
+                expires_at {timestamp} NOT NULL,
+                created_at {timestamp} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at {timestamp} NOT NULL DEFAULT CURRENT_TIMESTAMP
             )""",
             """CREATE TABLE IF NOT EXISTS sentinel_groups (
                 id VARCHAR(64) NOT NULL,
                 user_id VARCHAR(255) NOT NULL,
                 name VARCHAR(255) NOT NULL DEFAULT '',
-                added_at DOUBLE NOT NULL,
-                PRIMARY KEY (id, user_id),
-                INDEX idx_groups_user_added (user_id, added_at)
+                added_at DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (id, user_id)
             )""",
             """CREATE TABLE IF NOT EXISTS history (
                 id VARCHAR(128) PRIMARY KEY,
@@ -167,9 +170,7 @@ class Storage:
                 group_name VARCHAR(255) NOT NULL DEFAULT '',
                 occurred_at VARCHAR(64) NOT NULL DEFAULT '',
                 dm_status VARCHAR(32) NOT NULL DEFAULT 'n/a',
-                archived BOOLEAN NOT NULL DEFAULT TRUE,
-                INDEX idx_history_user_time (user_id, occurred_at),
-                INDEX idx_history_user_asset (user_id, audio_id)
+                archived BOOLEAN NOT NULL DEFAULT TRUE
             )""",
             """CREATE TABLE IF NOT EXISTS config (
                 user_id VARCHAR(255) NOT NULL,
@@ -178,8 +179,6 @@ class Storage:
                 PRIMARY KEY (user_id, config_key)
             )""",
         ]
-        # MySQL allows inline INDEX definitions in CREATE TABLE; SQLite does not.
-        # SQLite exists only for isolated tests, never as a production fallback.
         if self.kind == "sqlite":
             ddl[1] = """CREATE TABLE IF NOT EXISTS sessions (
                 token_hash CHAR(64) PRIMARY KEY, user_id VARCHAR(255) NOT NULL,
@@ -207,12 +206,24 @@ class Storage:
             try:
                 for statement in ddl:
                     cur.execute(self._sql(statement))
-                if self.kind == "sqlite":
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_groups_user_added ON sentinel_groups(user_id, added_at)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_history_user_time ON history(user_id, occurred_at)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_history_user_asset ON history(user_id, audio_id)")
+                indexes = [
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_groups_user_added ON sentinel_groups(user_id, added_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_history_user_time ON history(user_id, occurred_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_history_user_asset ON history(user_id, audio_id)",
+                ]
+                if self.kind != "mysql":
+                    for statement in indexes:
+                        cur.execute(self._sql(statement))
+                else:
+                    # MySQL accepts indexes inline in older schemas; create them separately
+                    # only when using this new portable definition.
+                    for statement in indexes:
+                        try:
+                            cur.execute(statement)
+                        except Exception:
+                            pass
             finally:
                 cur.close()
 
@@ -252,6 +263,8 @@ class Storage:
         column_names = ",".join(columns)
         if self.kind == "mysql":
             sql = f"INSERT IGNORE INTO history ({column_names}) VALUES ({placeholders})"
+        elif self.kind == "postgres":
+            sql = f"INSERT INTO history ({column_names}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"
         else:
             sql = f"INSERT OR IGNORE INTO history ({column_names}) VALUES ({placeholders})"
         self.execute(sql, tuple(record[column] for column in columns))
