@@ -74,5 +74,14 @@ form.addEventListener('submit', async event => {
 // Retire obsolete device-local profile flags; no legacy account state is imported.
 try { ['sentinel_exe_migrated','sentinel_exe_refresh_token','sentinel_profile_id','sentinel_profile_pin'].forEach(key => localStorage.removeItem(key)); } catch (_) {}
 setMode(mode); mountIcons();
+const returnTarget = new URLSearchParams(location.search).get('next');
+function leaveIfSignedIn() {
+  request('/auth/me').then(() => {
+    const destination = returnTarget && returnTarget.startsWith('/sentinel/') && returnTarget !== '/sentinel/login' ? returnTarget : '/sentinel';
+    location.replace(destination);
+  }).catch(() => {});
+}
+leaveIfSignedIn();
+window.addEventListener('pageshow', event => { if (event.persisted) leaveIfSignedIn(); });
 const video = document.querySelector('.account-background video');
 if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) video.pause();

@@ -368,6 +368,15 @@ async def trusted_refresh(request: Request, row: dict[str, Any]) -> JSONResponse
 
 async def provider_login(request: Request, path: str, body: dict[str, Any], remember_me: bool = False) -> JSONResponse:
     csrf(request)
+    if path == "/auth/login":
+        trusted = trusted_device(request)
+        if trusted:
+            try:
+                trusted_response = await trusted_refresh(request, trusted)
+                if not trusted_response.body or b'"requires_2fa"' not in trusted_response.body:
+                    return trusted_response
+            except (HTTPException, httpx.HTTPError):
+                pass
     response = await exe("POST", path, body)
     if response.get("requires_2fa"):
         trusted = trusted_device(request)
@@ -975,8 +984,13 @@ def dashboard(request: Request):
 
 
 @app.get("/sentinel/login")
-def login_page():
-    return static_file("login.html")
+def login_page(request: Request, next: str = "/sentinel"):
+    try:
+        user_from_request(request)
+        destination = next if next.startswith("/sentinel/") and next != "/sentinel/login" else "/sentinel"
+        return RedirectResponse(destination, status_code=303)
+    except HTTPException:
+        return static_file("login.html")
 
 
 @app.get("/sentinel")

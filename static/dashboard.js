@@ -9,7 +9,7 @@ function empty(symbol, title, description, action = '') {
 }
 async function api(path, options = {}) {
   try { return await request(path, options); }
-  catch (error) { if (error.status === 401) location.assign('/sentinel/login'); throw error; }
+  catch (error) { if (error.status === 401) location.assign('/sentinel/login?next=/sentinel/Dashboard'); throw error; }
 }
 function accountQuery(extra = '') { return `profile_id=${encodeURIComponent(user.id)}${extra}`; }
 function send(path, body = {}) { return api(path, {method:'POST',body:JSON.stringify({profile_id:user.id,...body})}); }

@@ -58,3 +58,14 @@
   .mobile-dashboard-nav .icon{width:24px;height:24px}
   .mobile-dashboard-nav small{font-size:8px;letter-spacing:.6px}
 }
+
+.dashboard-page{position:relative;isolation:isolate;background:#0a0a0a}
+.dashboard-video-background{position:fixed;inset:0;z-index:-1;overflow:hidden;background:#171717;pointer-events:none}
+.dashboard-video-background video{width:100%;height:100%;object-fit:cover;opacity:.18;filter:grayscale(1) contrast(1.08)}
+.dashboard-video-background span{position:absolute;inset:0;background:linear-gradient(90deg,#0a0a0af5 0%,#0a0a0ab8 45%,#0a0a0ad9 100%),linear-gradient(0deg,#0a0a0af5 0%,transparent 45%,#0a0a0acc 100%)}
+.dashboard-content,.dashboard-topbar,.dashboard-sidebar,.mobile-dashboard-nav{position:relative;z-index:1}
+@media(prefers-reduced-motion:reduce){.dashboard-video-background video{display:none}}
+@media(max-width:800px){
+  .mobile-dashboard-nav button,.mobile-dashboard-nav button:focus,.mobile-dashboard-nav button:active{appearance:none;-webkit-appearance:none;-webkit-tap-highlight-color:transparent;outline:none;background-color:transparent;color:#ffffff40;border:0;box-shadow:none}
+  .mobile-dashboard-nav button.active,.mobile-dashboard-nav button.active:focus,.mobile-dashboard-nav button.active:active{background-color:#ffffff12;color:#fff}
+}
