@@ -1,6 +1,6 @@
 # Sentinel
 
-Sentinel is a fresh-start Roblox group moderation workspace. The supplied beta's monochrome design and animated background are retained, with a new public landing page and account-based dashboard. No old profile database, PIN account, migration flow, or extension download is included.
+Sentinel is a fresh-start Roblox group moderation workspace. Its monochrome design and animated background are retained, with a new public landing page and account-based dashboard. No old profile database, PIN account, migration flow, or extension download is included.
 
 ## Routes
 

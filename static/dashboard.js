@@ -31,7 +31,7 @@ function openGroup() { $('group-error').textContent=''; $('group-form').reset();
 function errorBanner(error) { $('dashboard-error').textContent = error.message; $('dashboard-error').classList.remove('hidden'); }
 function renderStatus() {
   const monitoring = !!status.monitoring;
-  [ $('top-status'), $('monitor-status') ].forEach(element => { element.classList.toggle('online', monitoring); element.innerHTML = `<i></i> ${monitoring ? 'MONITORING' : 'STANDBY'}`; });
+  [ $('top-status'), $('monitor-status') ].forEach(element => { element.classList.toggle('online', monitoring); element.textContent = monitoring ? 'MONITORING' : 'STANDBY'; });
   $('monitor-heading').textContent = monitoring ? 'Sentinel is on watch.' : 'Ready when you are.';
   $('monitor-description').textContent = monitoring ? `Watching ${groups.length} ${groups.length === 1 ? 'group' : 'groups'} for uploads that don't fit your rules.` : status.hasCredential ? 'Your account is connected. Start monitoring when your groups and rules are ready.' : 'Connect a moderation account, add your groups, and let Sentinel take watch.';
   $('monitor-button').innerHTML = `${icon(monitoring ? 'pause' : 'play')}<span>${monitoring ? 'Pause monitoring' : 'Start monitoring'}</span>`;
@@ -44,7 +44,7 @@ function renderStatus() {
 }
 function groupHTML(group, removable = false) {
   const initials = String(group.name || 'Roblox group').split(/\s+/).map(word=>word[0]).join('').slice(0,2).toUpperCase();
-  return `<div class="group-row"><span class="group-avatar">${esc(initials)}</span><div class="group-details"><b>${esc(group.name || 'Roblox group')}</b><small>GROUP / ${esc(group.id)}</small></div><span class="status-label ${status.monitoring ? 'online' : ''}"><i></i>${status.monitoring ? 'ON WATCH' : 'STANDBY'}</span>${removable ? `<button class="icon-button" data-remove-group="${esc(group.id)}" aria-label="Remove ${esc(group.name || 'group')}">${icon('close')}</button>` : ''}</div>`;
+  return `<div class="group-row"><span class="group-avatar">${esc(initials)}</span><div class="group-details"><b>${esc(group.name || 'Roblox group')}</b><small>GROUP / ${esc(group.id)}</small></div><span class="status-label ${status.monitoring ? 'online' : ''}">${status.monitoring ? 'ON WATCH' : 'STANDBY'}</span>${removable ? `<button class="icon-button" data-remove-group="${esc(group.id)}" aria-label="Remove ${esc(group.name || 'group')}">${icon('close')}</button>` : ''}</div>`;
 }
 function activityHTML(item) {
   return `<div class="activity-row"><span class="activity-symbol">${icon(item.asset_type === 'Audio' ? 'audio':'box')}</span><div><b>${esc(item.audio_name || 'Asset ' + item.audio_id)}</b><small>${esc(item.group_name || 'Roblox group')} · ${esc(item.asset_type || 'Audio')}</small></div><span class="mini-badge">${item.archived ? 'ARCHIVED' : 'NOT ARCHIVED'}</span></div>`;
