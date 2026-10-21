@@ -33,6 +33,8 @@ class Storage:
             # Keep that disk usable, but start Sentinel in a new file so legacy
             # profiles and incompatible tables are never imported.
             legacy_path = os.environ.get("DB_PATH", "")
+            if not legacy_path and Path("/opt/render/project/src").is_dir():
+                legacy_path = "/opt/render/project/src/sentinel.db"
             if legacy_path:
                 fresh_path = os.environ.get("SENTINEL_DB_PATH", "")
                 if not fresh_path:
