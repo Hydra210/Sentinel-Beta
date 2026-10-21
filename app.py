@@ -35,6 +35,32 @@ STATIC.mkdir(exist_ok=True)
 app = FastAPI(title="Sentinel API", docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/sentinel/static", StaticFiles(directory=STATIC), name="static")
 
+
+# Friendly page aliases. API and static paths are deliberately excluded so asset
+# filenames and machine-readable endpoints keep their exact behavior.
+PAGE_ALIASES = {
+    "/sentinal": "/sentinel",
+    "/sentinell": "/sentinel",
+    "/sentinel/home": "/sentinel",
+    "/sentinel/start": "/sentinel",
+    "/sentinel/dashbord": "/sentinel/Dashboard",
+    "/sentinel/dashbaord": "/sentinel/Dashboard",
+    "/sentinel/dashboard": "/sentinel/Dashboard",
+}
+
+
+@app.middleware("http")
+async def normalize_sentinel_pages(request: Request, call_next):
+    path = request.url.path
+    lowered = path.lower()
+    target = PAGE_ALIASES.get(lowered)
+    if target is None and lowered in {"/sentinel", "/sentinel/", "/sentinel/login"} and path != lowered:
+        target = "/sentinel" if lowered in {"/sentinel", "/sentinel/"} else "/sentinel/login"
+    if target and path != target:
+        url = request.url.replace(path=target)
+        return RedirectResponse(str(url), status_code=308)
+    return await call_next(request)
+
 EXE_API_BASE = (os.getenv("EXE_API_BASE") or os.getenv("EXE_API_URL") or "https://exe-accounts-api.onrender.com").rstrip("/")
 EXE_JWT_SECRET = os.getenv("EXE_JWT_SECRET", "")
 COOKIE_NAME = "sentinel_session"  # deliberately not platform-reserved app_session_id
@@ -991,6 +1017,12 @@ def dashboard_lowercase(request: Request):
     except HTTPException:
         return RedirectResponse("/sentinel/login?next=/sentinel/Dashboard", status_code=303)
     return RedirectResponse("/sentinel/Dashboard", status_code=308)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+@app.get("/sentinel/favicon.ico", include_in_schema=False)
+def favicon():
+    return FileResponse(STATIC / "assets" / "sentinelLogo.png", media_type="image/png")
 
 
 @app.get("/sentinel/login")
