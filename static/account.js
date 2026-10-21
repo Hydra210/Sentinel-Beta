@@ -21,7 +21,7 @@ function setMode(next) {
   $('password').minLength = mode === 'create' ? 8 : 1;
   $('password').autocomplete = mode === 'create' ? 'new-password' : 'current-password';
   $('verification-code').required = mode === '2fa'; $('verification-code').disabled = mode !== '2fa';
-  $('remember-device-row').classList.toggle('hidden', !['login','2fa'].includes(mode));
+  $('remember-device-row').classList.toggle('hidden', mode !== '2fa');
   $('login-tab').classList.toggle('active', mode === 'login'); $('login-tab').setAttribute('aria-selected', String(mode === 'login'));
   $('create-tab').classList.toggle('active', mode === 'create'); $('create-tab').setAttribute('aria-selected', String(mode === 'create'));
   const copy = {
