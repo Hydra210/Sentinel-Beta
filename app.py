@@ -979,8 +979,18 @@ def dashboard(request: Request):
     try:
         user_from_request(request)
     except HTTPException:
-        return RedirectResponse("/sentinel/login", status_code=303)
+        return RedirectResponse("/sentinel/login?next=/sentinel/Dashboard", status_code=303)
     return static_file("dashboard.html")
+
+
+@app.get("/sentinel/dashboard")
+def dashboard_lowercase(request: Request):
+    """Accept the common lowercase spelling while keeping one canonical page URL."""
+    try:
+        user_from_request(request)
+    except HTTPException:
+        return RedirectResponse("/sentinel/login?next=/sentinel/Dashboard", status_code=303)
+    return RedirectResponse("/sentinel/Dashboard", status_code=308)
 
 
 @app.get("/sentinel/login")
@@ -1002,3 +1012,13 @@ def landing_page():
 @app.get("/manus-routes.json")
 def routes_manifest():
     return static_file("manus-routes.json")
+
+
+@app.exception_handler(404)
+async def sentinel_not_found(request: Request, exc: HTTPException):
+    """Use the branded page for website routes, but keep API misses machine-readable."""
+    if request.url.path.startswith("/sentinel/api") or request.url.path.startswith("/api"):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    if request.url.path.startswith("/sentinel") or request.url.path == "/":
+        return FileResponse(STATIC / "404.html", status_code=404)
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
