@@ -27,7 +27,18 @@ class StorageError(RuntimeError):
 
 class Storage:
     def __init__(self, database_url: str | None = None):
-        self.database_url = database_url or os.environ.get("DATABASE_URL", "")
+        configured_url = database_url or os.environ.get("DATABASE_URL", "")
+        if not configured_url:
+            # The original Render service used a persistent disk with DB_PATH.
+            # Keep that disk usable, but start Sentinel in a new file so legacy
+            # profiles and incompatible tables are never imported.
+            legacy_path = os.environ.get("DB_PATH", "")
+            if legacy_path:
+                fresh_path = os.environ.get("SENTINEL_DB_PATH", "")
+                if not fresh_path:
+                    fresh_path = str(Path(legacy_path).with_name("sentinel-fresh.db"))
+                configured_url = f"sqlite://{fresh_path}"
+        self.database_url = configured_url
         self.is_sqlite = self.database_url.startswith("sqlite://")
         if not self.database_url:
             self.kind = "unconfigured"

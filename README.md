@@ -14,6 +14,8 @@ For a native Render Python service, set `PYTHON_VERSION` to a supported released
 
 Account-linked moderation data uses the PostgreSQL or MySQL-compatible `DATABASE_URL` supplied by the deployment environment. PostgreSQL is supported directly for Render deployments. The database starts empty; the uploaded `sentinel.db` is deliberately not imported. EXE Accounts remains the authentication provider at `https://exe-accounts-api.onrender.com`.
 
+If the original Render service only has `DB_PATH` on its persistent disk, Sentinel uses a separate `sentinel-fresh.db` beside the legacy file. This preserves the disk while honoring the fresh-start requirement; legacy profiles, migration data, and incompatible old tables are not imported. Set `SENTINEL_DB_PATH` to choose a different fresh SQLite filename, or provide `DATABASE_URL` to use PostgreSQL/MySQL instead.
+
 ## Account and moderation safety
 
 Login is real and validated server-side; no demo identity or preview bypass is used. EXE account passwords and tokens are not placed in browser local storage. State-changing browser API requests require the Sentinel request header. User-owned API resources are scoped to the authenticated account.

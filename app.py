@@ -42,7 +42,7 @@ TTL = max(300, int(os.getenv("SENTINEL_SESSION_TTL_SECONDS", str(7 * 86400))))
 # A dedicated key may be supplied. Otherwise derive a namespaced encryption key
 # from the private, stable database credential; neither material reaches clients.
 # Rotating either credential deliberately invalidates encrypted provider tokens.
-_crypto_secret = os.getenv("SENTINEL_SESSION_SECRET") or os.getenv("DATABASE_URL") or secrets.token_urlsafe(48)
+_crypto_secret = os.getenv("SENTINEL_SESSION_SECRET") or os.getenv("DATABASE_URL") or os.getenv("DB_PATH") or secrets.token_urlsafe(48)
 fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(("sentinel:exe-token:v1:" + _crypto_secret).encode()).digest()))
 
 try:
