@@ -35,11 +35,6 @@ request('/auth/me').then(({user}) => {
       link.innerHTML = link.classList.contains('text-link') ? 'Continue to your workspace <span data-icon="arrow"></span>' : 'Open your dashboard <span data-icon="arrow"></span>';
     }
   });
-  const hero = document.querySelector('.hero');
-  if (hero && !document.querySelector('.signed-in-banner')) {
-    hero.insertAdjacentHTML('beforebegin', '<div class="signed-in-banner"><div><span class="signed-in-mark"></span><span><b>Workspace active</b><small>YOUR SENTINEL SESSION IS READY</small></span></div><a href="/sentinel/Dashboard">Open dashboard <span data-icon="arrow"></span></a></div>');
-    mountIcons();
-  }
 }).catch(() => {});
 document.getElementById('year').textContent = new Date().getFullYear();
 const video = document.getElementById('hero-video');
